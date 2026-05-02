@@ -93,13 +93,13 @@ included; see commit history if you want the rationale.
 
 ```bash
 # Project-local — adds to .pi/settings.json
-pi install -l git:github.com/<your-org>/pi-model-staging
+pi install -l git:github.com/carlhannes/pi-model-staging
 
 # Global — adds to ~/.pi/agent/settings.json
-pi install git:github.com/<your-org>/pi-model-staging
+pi install git:github.com/carlhannes/pi-model-staging
 
 # Try once without persisting
-pi -e git:github.com/<your-org>/pi-model-staging
+pi -e git:github.com/carlhannes/pi-model-staging
 ```
 
 Pi reads the `pi.extensions` field from this repo's `package.json` and
@@ -109,7 +109,7 @@ loads the extension automatically. You'll need to fork/edit the ladder in
 ### From a local clone
 
 ```bash
-git clone https://github.com/<your-org>/pi-model-staging
+git clone https://github.com/carlhannes/pi-model-staging
 cd pi-model-staging
 # Edit PROVIDER + LADDER in .pi/extensions/plan-stepdown/index.ts
 pi   # auto-discovers .pi/extensions/ when run from the project root
@@ -118,7 +118,7 @@ pi   # auto-discovers .pi/extensions/ when run from the project root
 ### Symlink for global use
 
 ```bash
-git clone https://github.com/<your-org>/pi-model-staging
+git clone https://github.com/carlhannes/pi-model-staging
 ln -s "$(pwd)/pi-model-staging/.pi/extensions/plan-stepdown" \
       ~/.pi/agent/extensions/plan-stepdown
 ```
