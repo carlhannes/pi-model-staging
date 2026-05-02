@@ -1,0 +1,15 @@
+# Local pi-mono clone, kept as a reference but never committed.
+pi-mono/
+
+# Node
+node_modules/
+*.log
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Pi runtime state we don't want in git
+.pi/sessions/
+.pi/cache/
