@@ -148,6 +148,12 @@ vLLM, LM Studio, your own proxy) configured in `~/.pi/agent/models.json`
 work exactly the same — see [pi's models docs](https://pi.dev/docs/latest/models)
 and [custom provider docs](https://pi.dev/docs/latest/custom-provider).
 
+A starter [models.example.json](models.example.json) is included for the
+"openai-responses-compatible proxy" use case — one provider with a few
+GPT-5.x model IDs (including `gpt-5.5:quick` for routing to a priority
+tier). Copy into `~/.pi/agent/models.json` (or merge into your existing
+file's `providers` map) and edit `baseUrl` / `apiKey` to match your setup.
+
 ### Tools allowed in plan vs execute
 
 Edit `PLAN_TOOLS` / `EXEC_TOOLS` if the defaults don't match your tool set.
