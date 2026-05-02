@@ -1,43 +1,78 @@
 # pi-model-staging
 
 A [pi](https://pi.dev) extension that adds a **plan-then-execute** workflow
-with a configurable **model ladder** — step the model and/or thinking level
-down on each LLM call (or each user prompt) inside a single conversation.
+with a **single configurable model ladder**. The model and reasoning level
+step down as the agent grinds through tool calls "by itself", and snap back
+to the snappy/user-facing tier whenever control returns to you.
 
-Use cases:
-- Burn `xhigh` thinking on the first turn of a task, step down so the boring
-  follow-up tool calls don't pay for full reasoning.
-- Use a "priority" / fast endpoint while you're shaping the plan, then a
-  cheaper endpoint while the agent is grinding through it.
-- Route different model names to different backend tiers via your own proxy.
+## The mental model
 
-## How it works
+One ladder, one counter. The principle: **stepping only happens while the
+LLM is working autonomously inside one agent run. Hand control back to the
+user → reset to the top.**
 
-Two independent ladders, both active at once:
+```ts
+const LADDER: Rung[] = [
+    { modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] snappy / user-facing
+    { modelId: "gpt-5.5",       thinking: "xhigh" }, // [1] first autonomous step
+    { modelId: "gpt-5.5",       thinking: "high"  }, // [2]
+    { modelId: "gpt-5.4",       thinking: "high"  }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high"  }, // [4]+ (last rung repeats)
+];
+```
 
-| Ladder        | Hook                       | Granularity            | Cross-provider? |
-|---------------|----------------------------|------------------------|-----------------|
-| **Per-run**   | `before_agent_start`       | One rung per user prompt | Yes           |
-| **Per-turn**  | `before_provider_request`  | One rung per LLM call   | **No** — same provider only |
+| Situation                                                            | Rung used   |
+|----------------------------------------------------------------------|-------------|
+| Plan mode (every LLM call while shaping the plan)                    | `LADDER[0]` |
+| Auto-injected "Execute the plan." run, turn 1                        | `LADDER[1]` |
+| Same run, turn 2, 3, ...                                             | step down   |
+| `agent_end` during executing → user gets control back                | reset to 0  |
+| User follow-up prompt, turn 1 (LLM responding to user, "user-facing")| `LADDER[0]` |
+| Same prompt, turn 2, 3, ... (autonomous tool calls)                  | step down   |
+| Re-entering `/plan`                                                  | `LADDER[0]` |
 
-Why two: pi captures `model` and `reasoning` once when it builds
-`AgentLoopConfig` ([agent.ts:413](https://github.com/badlogic/pi-mono/blob/main/packages/agent/src/agent.ts#L413))
-and reuses them for every turn inside one agent run. Calling `pi.setModel()`
-mid-loop never reaches the in-flight request — it only takes effect on the
-*next* `agent.prompt()` call. So:
+So `[0]` covers "user is in control or shaping the plan", `[1]` is "first
+step into autonomous work", and `[2..]` are progressive degradation as the
+agent keeps grinding without checking back in.
 
-- **Per-run** uses the documented `pi.setModel()` / `pi.setThinkingLevel()`
-  API and switches anything (provider, baseUrl, API key) freely.
-- **Per-turn** rewrites the serialized wire payload at
-  `before_provider_request` ([sdk.ts:345](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/sdk.ts#L345)),
-  changing `model` and `reasoning_effort` / `reasoning.effort` /
-  `output_config.effort` depending on the API. The HTTP client is built
-  *before* this hook fires, so `baseUrl` + `apiKey` stay locked to the
-  per-run model — same provider only.
+## How it actually works
 
-If you need cross-provider per-turn swaps, that requires a small upstream
-patch to pi-mono (`createLoopConfig` → getter style). Not included here; see
-the comment block at the top of `index.ts` for the full reasoning.
+The architectural problem: pi captures `model` and `reasoning` once when it
+builds `AgentLoopConfig` ([agent.ts:413](https://github.com/badlogic/pi-mono/blob/main/packages/agent/src/agent.ts#L413))
+and reuses them for every turn inside one agent run. Calling
+`pi.setModel()` mid-loop never reaches the in-flight request.
+
+This extension uses two mechanisms together:
+
+1. **`pi.setModel()` once at `/plan`** — binds the provider, baseUrl, and
+   API key for every agent run that follows. We don't call it again, to
+   avoid pi's setModel side-effect of persisting a new default in your
+   settings.
+2. **`before_provider_request` payload rewriting on every LLM call** —
+   rewrites the wire payload's `model` and `reasoning_effort` /
+   `reasoning.effort` / `output_config.effort` (depending on API) to
+   whatever `LADDER[stage]` says. This is what enables stepping inside one
+   agent run.
+
+### Same-provider constraint
+
+All rungs must live on the same provider. The HTTP client is built **before**
+`before_provider_request` runs (e.g.
+[anthropic.ts:466](https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/providers/anthropic.ts#L466)),
+binding `baseUrl` + `apiKey` from the per-run model. Rewriting the payload
+to reference a model on a different provider would still send the request
+to the original endpoint with the original key — wrong destination, likely
+wrong wire format too.
+
+In practice: change the `PROVIDER` constant once, then pick freely from the
+models that provider exposes. If your provider is your own proxy (the
+intended use case), you can use the model name to route to different
+backend tiers — see [models.example.json](models.example.json) for the
+proxy setup pattern.
+
+If you need true per-turn cross-provider swaps, that requires a small
+upstream patch to pi-mono (`createLoopConfig` → getter style). Not
+included; see commit history if you want the rationale.
 
 ## Requirements
 
@@ -45,7 +80,7 @@ the comment block at the top of `index.ts` for the full reasoning.
   tested against pi-mono `main` as of May 2026)
 - Node.js 22+ (only for running the test suite — pi itself bundles its own
   runtime via [jiti](https://github.com/unjs/jiti))
-- Provider with one of the supported APIs:
+- A provider with one of the supported APIs:
   - OpenAI Responses (full support: model + reasoning effort)
   - OpenAI Completions (full support)
   - Anthropic adaptive thinking (model + effort via `output_config`)
@@ -67,8 +102,8 @@ pi install git:github.com/<your-org>/pi-model-staging
 pi -e git:github.com/<your-org>/pi-model-staging
 ```
 
-Pi reads the `pi.extensions` field from this repo's `package.json` and loads
-the extension automatically. You'll need to fork/edit the ladders in
+Pi reads the `pi.extensions` field from this repo's `package.json` and
+loads the extension automatically. You'll need to fork/edit the ladder in
 `index.ts` for your own model setup — see [Configuration](#configuration).
 
 ### From a local clone
@@ -76,7 +111,7 @@ the extension automatically. You'll need to fork/edit the ladders in
 ```bash
 git clone https://github.com/<your-org>/pi-model-staging
 cd pi-model-staging
-# Edit ladders in .pi/extensions/plan-stepdown/index.ts to match your models
+# Edit PROVIDER + LADDER in .pi/extensions/plan-stepdown/index.ts
 pi   # auto-discovers .pi/extensions/ when run from the project root
 ```
 
@@ -97,49 +132,31 @@ extension load errors.
 ## Configuration
 
 Open [.pi/extensions/plan-stepdown/index.ts](.pi/extensions/plan-stepdown/index.ts)
-and edit the four ladders near the top:
+and edit the two things near the top:
 
 ```ts
-// Per-run: one rung per user prompt. Can change provider freely.
-const PLAN_RUN_LADDER: RunRung[] = [
-    { provider: "openai-priority", modelId: "gpt-5.5", thinking: "xhigh" },
-    { provider: "openai-priority", modelId: "gpt-5.5", thinking: "high" },
-];
+const PROVIDER = "openai-proxy";
 
-const EXEC_RUN_LADDER: RunRung[] = [
-    { provider: "openai", modelId: "gpt-5.5", thinking: "xhigh" },
-    { provider: "openai", modelId: "gpt-5.5", thinking: "high" },
-    { provider: "openai", modelId: "gpt-5.4", thinking: "xhigh" },
-    { provider: "openai", modelId: "gpt-5.4", thinking: "high" },
-];
-
-// Per-turn: one rung per LLM call inside a run. Same provider only.
-const PLAN_TURN_LADDER: TurnRung[] = [
-    { modelId: "gpt-5.5", thinking: "xhigh" },
-    { modelId: "gpt-5.5", thinking: "high" },
-    { modelId: "gpt-5.5", thinking: "medium" },
-];
-
-const EXEC_TURN_LADDER: TurnRung[] = [
-    { modelId: "gpt-5.5", thinking: "xhigh" },
-    { modelId: "gpt-5.5", thinking: "high" },
-    { modelId: "gpt-5.4", thinking: "xhigh" },
-    { modelId: "gpt-5.4", thinking: "high" },
+const LADDER: Rung[] = [
+    { modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan + user-facing
+    { modelId: "gpt-5.5",       thinking: "xhigh" }, // [1] first autonomous step
+    { modelId: "gpt-5.5",       thinking: "high"  }, // [2]
+    { modelId: "gpt-5.4",       thinking: "high"  }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high"  }, // [4]+ (clamps here forever)
 ];
 ```
 
 ### Field reference
 
-**`RunRung`** (per-run)
-- `provider` — string. Must match a provider known to pi (`pi --list-models`
-  shows them, including custom ones from `~/.pi/agent/models.json`).
-- `modelId` — string. Must match a model ID for that provider.
-- `thinking` — `"minimal" | "low" | "medium" | "high" | "xhigh"`. Auto-clamped
-  to model capabilities (e.g. setting `xhigh` on a model that only supports
-  `high` will silently drop to `high`).
+**`PROVIDER`** — string. Must match a provider known to pi
+(`pi --list-models` shows them, including custom ones from
+`~/.pi/agent/models.json`). All rungs use this provider.
 
-**`TurnRung`** (per-turn)
-- Same as `RunRung` minus `provider` (see same-provider constraint above).
+**`Rung`**
+- `modelId` — string. Must match a model ID for `PROVIDER`.
+- `thinking` — `"minimal" | "low" | "medium" | "high" | "xhigh"`.
+  Auto-clamped to model capabilities (e.g. setting `xhigh` on a model that
+  only supports `high` will silently drop to `high`).
 
 ### Model and provider names
 
@@ -149,66 +166,68 @@ work exactly the same — see [pi's models docs](https://pi.dev/docs/latest/mode
 and [custom provider docs](https://pi.dev/docs/latest/custom-provider).
 
 A starter [models.example.json](models.example.json) is included for the
-"openai-responses-compatible proxy" use case — one provider with a few
+"openai-responses-compatible proxy" use case — one provider with several
 GPT-5.x model IDs (including `gpt-5.5:quick` for routing to a priority
 tier). Copy into `~/.pi/agent/models.json` (or merge into your existing
 file's `providers` map) and edit `baseUrl` / `apiKey` to match your setup.
 
 ### Tools allowed in plan vs execute
 
-Edit `PLAN_TOOLS` / `EXEC_TOOLS` if the defaults don't match your tool set.
-Default plan-mode tools are read-only: `read`, `bash`, `grep`, `find`, `ls`.
-Default execute tools add `edit` and `write`.
+Edit `PLAN_TOOLS` / `EXEC_TOOLS` in `index.ts` if the defaults don't match
+your tool set. Default plan-mode tools are read-only: `read`, `bash`,
+`grep`, `find`, `ls`. Default execute tools add `edit` and `write`.
 
 ### System-prompt nudges
 
-Edit `PLAN_PROMPT` and `EXEC_FIRST_PROMPT` to change the messages that get
-injected at the start of plan / execute phases.
+Edit `PLAN_PROMPT` and `EXEC_FIRST_PROMPT` in `index.ts` to change the
+messages that get injected at the start of plan / execute phases.
 
 ## Usage
 
 ```
 > /plan
-plan-stepdown: Plan mode ON. Next prompt: run rung openai-priority/gpt-5.5:xhigh ·
-turn rung gpt-5.5:xhigh
+plan-stepdown: Plan mode ON. Every LLM call uses [0] openai-proxy/gpt-5.5:quick:xhigh
 
 > How should I refactor the auth module?
-[plan produced — ladder ticks per LLM call]
+[plan produced — every LLM call inside this run uses LADDER[0]]
 
 [dialog appears]
 Plan ready — what next?
   > Execute the plan
-    Refine — stay in plan mode (advances ladders)
+    Refine — stay in plan mode
     Cancel — leave plan mode
 
 > Execute the plan
-[exec phase begins, EXEC_RUN_LADDER[0] applied, EXEC_TURN_LADDER walks each LLM call]
+[exec phase begins, first LLM call uses LADDER[1], next [2], next [3], ...
+ last rung repeats. When done, status snaps back to LADDER[0]]
+
+> also add tests for it
+[user follow-up — first LLM call uses LADDER[0] (user-facing), then steps
+ down through LADDER[1], LADDER[2], ... again]
 ```
 
-The status line at the bottom shows live ladder positions:
-`▶ exec run 1/4 openai/gpt-5.5:xhigh · turn 3/4 gpt-5.4:xhigh`.
+The status line at the bottom shows the live cursor:
+`▶ exec [2] openai-proxy/gpt-5.5:high (3/5)`.
 
 ### Commands
 
 | Command          | What it does |
 |------------------|--------------|
-| `/plan`          | Enter plan mode, restrict to read-only tools, queue `PLAN_RUN_LADDER[0]` for next prompt |
-| `/stepdown`      | Print the active ladders with the current cursor position |
+| `/plan`          | Enter plan mode, restrict to read-only tools, bind provider for the upcoming runs |
+| `/stepdown`      | Print the ladder with the current cursor position |
 | `/stepdown-off`  | Exit plan/execute mode, restore full tools |
 
-### How rungs advance
+### State machine summary
 
-- `agent_start` → reset per-turn counter (`planTurn` / `execTurn` = 0)
-- `before_agent_start` → apply per-run rung at index `planRun`/`execRun`,
-  then increment that counter
-- `before_provider_request` → apply per-turn rung at index
-  `planTurn`/`execTurn` (does not increment — increment happens at
-  `turn_end`)
-- `turn_end` → increment per-turn counter, but **not** if the turn was
-  aborted (so `/resume` picks up at the same rung)
-
-The last rung repeats forever — a 4-rung ladder over 100 turns just stays at
-rung 4.
+| Event                                  | Stage transition                              |
+|----------------------------------------|-----------------------------------------------|
+| `/plan`                                | `mode=planning, stage=0`                      |
+| Every LLM call (planning)              | uses `LADDER[0]` regardless of stage          |
+| Plan accepted                          | `mode=executing, stage=1`                     |
+| `turn_end` during executing            | `stage = min(stage+1, LADDER.length-1)`       |
+| Aborted turn                           | stage NOT advanced (so /resume picks up here) |
+| `agent_end` during executing           | `stage=0` (reset for next user prompt)        |
+| `/plan` again, or `/stepdown-off`      | reset                                         |
 
 ## Tests
 
@@ -216,26 +235,27 @@ rung 4.
 npm test
 ```
 
-Runs 24 unit tests via Node's built-in test runner with type stripping
+Runs 23 unit tests via Node's built-in test runner with type stripping
 (no extra deps). Coverage:
 
 - API detection: OpenAI Responses / OpenAI Completions / Anthropic adaptive /
   Anthropic budget / Google / unknown payloads
 - Payload rewriting per API: model + reasoning swap, no input mutation,
   graceful degradation on unknown payloads
-- Ladder clamping: empty / past end / negative
-- Mode-aware rung selection (`chooseRung`)
-- End-to-end: 5-turn execution with a 4-rung ladder, asserting model and
-  effort sequence including clamp at the end
+- `chooseRung` mode/stage dispatch including clamping
+- **End-to-end lifecycle**: simulates a full plan run → accept → exec run
+  with stepping → agent_end reset → user follow-up → second reset, and
+  asserts the exact sequence of model + effort values that hits the wire
+  at every LLM call
 
-The pure logic lives in [rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts) (no pi imports),
-so tests run without pi or any LLM API keys.
+The pure logic lives in [rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts)
+(no pi imports), so tests run without pi or any LLM API keys.
 
 ## Troubleshooting
 
 **`plan-stepdown: model X/Y not found`**
-The provider/model name in your ladder doesn't match what's in
-`pi --list-models`. Fix the typo, or register a custom provider in
+The model ID in your ladder doesn't match what's in `pi --list-models` for
+`PROVIDER`. Fix the typo, or register a custom provider in
 `~/.pi/agent/models.json`. The extension resets to idle on this error so it
 won't keep firing.
 
@@ -244,37 +264,36 @@ Run `pi auth login` for that provider, or set the env var (see
 [pi-mono/packages/ai/src/env-api-keys.ts](https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/env-api-keys.ts)
 for the var names per provider).
 
-**Per-turn rung doesn't seem to apply**
-Confirm the per-run model and the per-turn `modelId` are on the same
-provider (same `provider` field in `pi --list-models`). If the per-run model
-is `openai/gpt-5.5` and the per-turn rung says `modelId: "anthropic-model"`,
-the request still goes to OpenAI's endpoint with the OpenAI key — wrong
-shape, wrong destination.
+**Pi shows the wrong model in its status display**
+We deliberately call `setModel()` only once at `/plan`. Pi's display reads
+`agent.state.model` and so shows `LADDER[0]`'s model the whole time. The
+*actual* model that hits the wire is whatever the per-call rewrite
+substitutes — our own status widget shows the truth. We avoid calling
+`setModel()` per turn because it persists the new model as the default in
+`settings.json`, which would bounce around constantly.
 
 **Status widget doesn't appear**
 The widget needs an interactive TUI. In `pi --print` / `--mode json` /
 `--mode rpc`, the widget is suppressed but the model swaps still happen.
 
-**`pi.setModel failed for ...`**
-Usually means auth wasn't configured for that provider. Surface the full
-error from your terminal — it's forwarded from `setModel`'s thrown error.
-
 **Plan-ready dialog never appears**
-The dialog is gated on `ctx.hasUI`. In non-interactive modes you'll need to
-flip phases manually with another extension or by re-prompting after the
-plan finishes.
+The dialog is gated on `ctx.hasUI`. In non-interactive modes you'll need
+to flip phases manually with another extension or by re-prompting after
+the plan finishes.
 
 ## Limitations
 
-- Per-turn ladders are same-provider only (architectural — see top of file).
-- Anthropic budget thinking and Google models swap `model` only; the thinking
-  budget is left alone. Use adaptive Anthropic models or set explicit budgets
-  in your proxy if you need per-turn budget control.
-- Refining a plan keeps advancing both ladders. If you want refinement to
-  reset to the top of the plan ladder, edit the `agent_end` handler in
-  `index.ts` — three lines.
-- The state we persist across `/resume` is `mode + planRun + execRun`. The
-  per-turn counters reset on every agent run anyway, so they're not stored.
+- All rungs must be on the same provider (architectural — see "Same-provider
+  constraint" above).
+- Anthropic budget thinking and Google models swap `model` only; the
+  thinking budget is left alone. Use adaptive Anthropic models or set
+  explicit budgets in your proxy if you need per-turn budget control.
+- The state we persist across `/resume` is `mode + stage`. The state
+  machine resumes correctly but the auto-injected `EXEC_FIRST_PROMPT`
+  fires only once per accept, not on resume.
+- `setModel()` is called only at `/plan`, so re-entering `/plan` after a
+  long executing session will re-bind the provider but pi's display may
+  still lag for a moment until the next turn.
 
 ## How this extension is built
 
@@ -283,10 +302,11 @@ If you want to fork or learn from it:
 - [.pi/extensions/plan-stepdown/index.ts](.pi/extensions/plan-stepdown/index.ts)
   — event subscriptions, mode/state, command registration.
 - [.pi/extensions/plan-stepdown/rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts)
-  — pure functions for API detection and payload rewriting. Zero pi imports
-  so it's testable in isolation.
+  — pure functions for API detection and payload rewriting. Zero pi
+  imports so it's testable in isolation.
 - [.pi/extensions/plan-stepdown/rewrite.test.ts](.pi/extensions/plan-stepdown/rewrite.test.ts)
-  — 24 unit tests with realistic payload fixtures.
+  — 23 unit tests with realistic payload fixtures and full lifecycle
+  simulation.
 
 The pi APIs used are documented at:
 - [pi extensions guide](https://pi.dev/docs/latest/extensions)
@@ -297,7 +317,8 @@ The pi APIs used are documented at:
 - [`createLoopConfig`](https://github.com/badlogic/pi-mono/blob/main/packages/agent/src/agent.ts#L410)
   — explains why per-turn swaps need payload rewriting
 
-The existing upstream [plan-mode example](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/examples/extensions/plan-mode)
+The existing upstream
+[plan-mode example](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/examples/extensions/plan-mode)
 is a good reference for the plan/execute UX pattern this extension extends.
 
 ## Contributing
@@ -306,19 +327,20 @@ Issues and PRs welcome. The change surface is small:
 
 - Logic changes go in `rewrite.ts` with corresponding tests in
   `rewrite.test.ts`. Run `npm test` before sending a PR.
-- Pi-API integration lives in `index.ts`. There are no integration tests for
-  this layer — verify by running `pi` locally and watching the status
+- Pi-API integration lives in `index.ts`. There are no integration tests
+  for this layer — verify by running `pi` locally and watching the status
   widget plus your provider's request logs.
 
-If you add support for a new API family, add a fixture and a detection test
-to `rewrite.test.ts`. The fixture should mirror what the corresponding
-provider in [pi-mono's `packages/ai/src/providers/`](https://github.com/badlogic/pi-mono/tree/main/packages/ai/src/providers)
+If you add support for a new API family, add a fixture and a detection
+test to `rewrite.test.ts`. The fixture should mirror what the corresponding
+provider in
+[pi-mono's `packages/ai/src/providers/`](https://github.com/badlogic/pi-mono/tree/main/packages/ai/src/providers)
 actually sends on the wire.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
-This extension is independent of pi but builds on its public extension API.
-pi itself is also MIT-licensed
+This extension is independent of pi but builds on its public extension
+API. pi itself is also MIT-licensed
 ([badlogic/pi-mono](https://github.com/badlogic/pi-mono)).

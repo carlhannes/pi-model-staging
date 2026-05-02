@@ -1,17 +1,19 @@
 /**
- * Pure payload-rewriting logic for plan-stepdown's per-turn ladder.
+ * Pure payload-rewriting logic for plan-stepdown's single ladder.
  *
  * Kept free of pi imports so it can be unit-tested in isolation. Detects
  * which provider API the payload speaks and rewrites the model + reasoning
- * fields in place of a copy. Same-provider only — see README for why.
+ * fields on a copy. Same-provider only — see README.
  */
 
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 
-export type TurnRung = {
+export type Rung = {
 	modelId: string;
 	thinking: ThinkingLevel;
 };
+
+export type Mode = "idle" | "planning" | "executing";
 
 export type ApiKind =
 	| "openai-responses"
@@ -21,29 +23,44 @@ export type ApiKind =
 	| "unknown";
 
 /**
- * Pick the rung for a given turn index, clamped so going past the end
- * just repeats the last rung forever.
+ * Which rung applies given mode + the executing-stage counter.
+ *
+ *   idle       → null (extension does nothing)
+ *   planning   → ladder[0] (always, for every LLM call during planning)
+ *   executing  → ladder[stage], clamped to last rung so going past the
+ *                end repeats the strongest tier-down forever
+ *
+ * `stage` is a single global counter. It's set to 1 when the user accepts
+ * the plan, then incremented at the end of every executing turn. So:
+ *   stage=1 → ladder[1]  (first LLM call after plan accepted)
+ *   stage=2 → ladder[2]  (second LLM call)
+ *   ...and so on
  */
-export function rungAt<R>(ladder: readonly R[], turnIdx: number): R | undefined {
-	if (ladder.length === 0) return undefined;
-	const idx = Math.max(0, Math.min(turnIdx, ladder.length - 1));
+export function chooseRung(
+	mode: Mode,
+	stage: number,
+	ladder: readonly Rung[],
+): Rung | null {
+	if (mode === "idle") return null;
+	if (ladder.length === 0) return null;
+	if (mode === "planning") return ladder[0];
+	const idx = Math.max(0, Math.min(stage, ladder.length - 1));
 	return ladder[idx];
 }
 
 /**
  * Detect the provider API by sniffing distinctive payload fields. The
- * payload is the wire request body about to be sent to the provider — see
+ * payload is the wire request body about to be sent — see
  * pi-mono/packages/ai/src/providers/*.ts for the exact builders.
  */
 export function detectApi(payload: unknown): ApiKind {
 	if (!payload || typeof payload !== "object") return "unknown";
 	const p = payload as Record<string, unknown>;
 
-	// OpenAI Responses uses `input` (array) instead of `messages`. See
-	// openai-responses.ts: `{ model, input, stream, prompt_cache_key, ... }`.
+	// OpenAI Responses uses `input` (array) instead of `messages`.
 	if (Array.isArray(p.input)) return "openai-responses";
 
-	// Google uses `contents` with `generationConfig`. See google.ts.
+	// Google uses `contents` with `generationConfig`.
 	if (Array.isArray(p.contents)) return "google";
 
 	// Anthropic and OpenAI Completions both have `messages`. Anthropic has
@@ -56,10 +73,6 @@ export function detectApi(payload: unknown): ApiKind {
 		) {
 			return "anthropic";
 		}
-		// Anthropic without a system prompt and without thinking enabled is
-		// indistinguishable from openai-completions on shape alone. We assume
-		// completions; pi will set thinking on Anthropic models that support
-		// it, so the ambiguous case is rare in practice.
 		return "openai-completions";
 	}
 
@@ -67,11 +80,11 @@ export function detectApi(payload: unknown): ApiKind {
 }
 
 /**
- * Return a NEW payload object with model/reasoning swapped for `rung`.
+ * Return a NEW payload object with model + reasoning swapped for `rung`.
  * Never mutates the input. Same-provider only — caller is responsible for
  * making sure the rung's model lives on the same provider as the original.
  */
-export function applyRungToPayload(payload: unknown, rung: TurnRung): unknown {
+export function applyRungToPayload(payload: unknown, rung: Rung): unknown {
 	if (!payload || typeof payload !== "object") return payload;
 	const api = detectApi(payload);
 	const out: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
@@ -82,18 +95,13 @@ export function applyRungToPayload(payload: unknown, rung: TurnRung): unknown {
 		case "openai-responses": {
 			const prev = (out.reasoning as Record<string, unknown> | undefined) ?? {};
 			out.reasoning = { ...prev, effort: rung.thinking };
-			// Echo summary if it was set; if reasoning wasn't enabled at all
-			// before, default to "auto" so we don't drop encrypted reasoning.
 			if (!("summary" in prev)) {
 				(out.reasoning as Record<string, unknown>).summary = "auto";
 			}
-			// `include` controls encrypted reasoning blocks — preserve if set.
 			break;
 		}
 		case "openai-completions": {
 			out.reasoning_effort = rung.thinking;
-			// OpenRouter compat uses nested `reasoning.effort`. If the original
-			// payload had it, keep that shape too.
 			if (
 				typeof out.reasoning === "object" &&
 				out.reasoning !== null &&
@@ -105,46 +113,16 @@ export function applyRungToPayload(payload: unknown, rung: TurnRung): unknown {
 		}
 		case "anthropic": {
 			const thinking = out.thinking as Record<string, unknown> | undefined;
-			// Adaptive thinking models use top-level `output_config.effort`.
 			if (thinking?.type === "adaptive") {
 				out.output_config = { effort: rung.thinking };
 			}
-			// Budget-based thinking uses `thinking.budget_tokens` directly. We
-			// don't try to translate effort→tokens here; if you need that,
-			// set the ladder up with explicit budgets in a separate field or
-			// pre-translate in your proxy. The model swap still applies.
 			break;
 		}
-		case "google": {
-			// Google uses generationConfig.thinkingConfig.thinkingBudget. Same
-			// caveat as Anthropic budget-based: we leave the budget alone and
-			// only swap the model. Pi maps effort→budget; doing it here would
-			// duplicate that mapping.
+		case "google":
 			break;
-		}
 		case "unknown":
-			// Best-effort: just rewrite model. Better than crashing.
 			break;
 	}
 
 	return out;
-}
-
-/**
- * Decide which ladder + turn index applies given the current mode and
- * counters. Returns null if the extension shouldn't act this turn.
- */
-export type Mode = "idle" | "planning" | "executing";
-
-export function chooseRung(
-	mode: Mode,
-	planTurn: number,
-	execTurn: number,
-	planLadder: readonly TurnRung[],
-	execLadder: readonly TurnRung[],
-): TurnRung | null {
-	if (mode === "idle") return null;
-	const ladder = mode === "planning" ? planLadder : execLadder;
-	const idx = mode === "planning" ? planTurn : execTurn;
-	return rungAt(ladder, idx) ?? null;
 }

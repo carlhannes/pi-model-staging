@@ -16,8 +16,7 @@ import {
 	applyRungToPayload,
 	chooseRung,
 	detectApi,
-	rungAt,
-	type TurnRung,
+	type Rung,
 } from "./rewrite.ts";
 
 // ============================================================================
@@ -84,36 +83,8 @@ test("detectApi: garbage", () => {
 	assert.equal(detectApi({ random: "field" }), "unknown");
 });
 
-// ============================================================================
-// rungAt clamping
-// ============================================================================
-
-test("rungAt: returns rung at index", () => {
-	const ladder = [
-		{ modelId: "a", thinking: "high" as const },
-		{ modelId: "b", thinking: "medium" as const },
-	];
-	assert.deepEqual(rungAt(ladder, 0), ladder[0]);
-	assert.deepEqual(rungAt(ladder, 1), ladder[1]);
-});
-
-test("rungAt: clamps past end to last", () => {
-	const ladder = [
-		{ modelId: "a", thinking: "high" as const },
-		{ modelId: "b", thinking: "medium" as const },
-	];
-	assert.deepEqual(rungAt(ladder, 2), ladder[1]);
-	assert.deepEqual(rungAt(ladder, 999), ladder[1]);
-});
-
-test("rungAt: clamps negative to first", () => {
-	const ladder = [{ modelId: "a", thinking: "high" as const }];
-	assert.deepEqual(rungAt(ladder, -1), ladder[0]);
-});
-
-test("rungAt: empty ladder returns undefined", () => {
-	assert.equal(rungAt([], 0), undefined);
-});
+// (rungAt was inlined into chooseRung — its clamping behaviour is now
+// covered by the chooseRung tests below.)
 
 // ============================================================================
 // applyRungToPayload — OpenAI Responses
@@ -275,75 +246,137 @@ test("non-object payload: passes through unchanged", () => {
 });
 
 // ============================================================================
-// chooseRung — mode/turn dispatch
+// chooseRung — mode/stage dispatch
 // ============================================================================
 
-const PLAN_LADDER: TurnRung[] = [
-	{ modelId: "p1", thinking: "xhigh" },
-	{ modelId: "p2", thinking: "high" },
-];
-const EXEC_LADDER: TurnRung[] = [
-	{ modelId: "e1", thinking: "xhigh" },
-	{ modelId: "e2", thinking: "high" },
-	{ modelId: "e3", thinking: "medium" },
+const LADDER: Rung[] = [
+	{ modelId: "quick", thinking: "xhigh" },  // [0] plan + user-facing
+	{ modelId: "model-a", thinking: "xhigh" }, // [1] first autonomous step
+	{ modelId: "model-a", thinking: "high" },  // [2]
+	{ modelId: "model-b", thinking: "high" },  // [3]
 ];
 
 test("chooseRung: idle → null", () => {
-	assert.equal(chooseRung("idle", 0, 0, PLAN_LADDER, EXEC_LADDER), null);
+	assert.equal(chooseRung("idle", 0, LADDER), null);
+	assert.equal(chooseRung("idle", 99, LADDER), null);
 });
 
-test("chooseRung: planning uses planTurn against PLAN_LADDER", () => {
-	assert.deepEqual(chooseRung("planning", 0, 99, PLAN_LADDER, EXEC_LADDER), PLAN_LADDER[0]);
-	assert.deepEqual(chooseRung("planning", 1, 99, PLAN_LADDER, EXEC_LADDER), PLAN_LADDER[1]);
-	// past end → clamps to last
-	assert.deepEqual(chooseRung("planning", 5, 99, PLAN_LADDER, EXEC_LADDER), PLAN_LADDER[1]);
+test("chooseRung: empty ladder → null", () => {
+	assert.equal(chooseRung("planning", 0, []), null);
+	assert.equal(chooseRung("executing", 5, []), null);
 });
 
-test("chooseRung: executing uses execTurn against EXEC_LADDER", () => {
-	assert.deepEqual(chooseRung("executing", 99, 0, PLAN_LADDER, EXEC_LADDER), EXEC_LADDER[0]);
-	assert.deepEqual(chooseRung("executing", 99, 2, PLAN_LADDER, EXEC_LADDER), EXEC_LADDER[2]);
-	assert.deepEqual(chooseRung("executing", 99, 99, PLAN_LADDER, EXEC_LADDER), EXEC_LADDER[2]);
+test("chooseRung: planning always returns LADDER[0] regardless of stage", () => {
+	assert.deepEqual(chooseRung("planning", 0, LADDER), LADDER[0]);
+	assert.deepEqual(chooseRung("planning", 1, LADDER), LADDER[0]);
+	assert.deepEqual(chooseRung("planning", 99, LADDER), LADDER[0]);
+});
+
+test("chooseRung: executing returns LADDER[stage]", () => {
+	assert.deepEqual(chooseRung("executing", 0, LADDER), LADDER[0]);
+	assert.deepEqual(chooseRung("executing", 1, LADDER), LADDER[1]);
+	assert.deepEqual(chooseRung("executing", 2, LADDER), LADDER[2]);
+	assert.deepEqual(chooseRung("executing", 3, LADDER), LADDER[3]);
+});
+
+test("chooseRung: executing past the end clamps to last", () => {
+	assert.deepEqual(chooseRung("executing", 4, LADDER), LADDER[3]);
+	assert.deepEqual(chooseRung("executing", 99, LADDER), LADDER[3]);
+});
+
+test("chooseRung: executing with negative stage clamps to first", () => {
+	assert.deepEqual(chooseRung("executing", -1, LADDER), LADDER[0]);
 });
 
 // ============================================================================
-// End-to-end: simulate a full agent run with 5 turns and confirm each turn's
-// payload gets the right rung applied.
+// End-to-end lifecycle: simulate the full plan→exec→follow-up flow and
+// confirm each LLM call gets the right rung's model + effort.
+//
+// The state machine driving stage transitions lives in index.ts, but the
+// rules are simple enough to encode inline here:
+//
+//   /plan                          mode=planning, stage=0
+//   turn_end during executing      stage = min(stage+1, len-1)
+//   accept                         mode=executing, stage=1
+//   agent_end during executing     stage=0
 // ============================================================================
 
-test("end-to-end: 5 exec turns walk down EXEC_LADDER and clamp", () => {
-	const ladder: TurnRung[] = [
+test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
+	const ladder: Rung[] = [
+		{ modelId: "gpt-5.5:quick", thinking: "xhigh" },
 		{ modelId: "gpt-5.5", thinking: "xhigh" },
 		{ modelId: "gpt-5.5", thinking: "high" },
-		{ modelId: "gpt-5.4", thinking: "xhigh" },
 		{ modelId: "gpt-5.4", thinking: "high" },
 	];
 	const basePayload = () => ({
-		model: "gpt-5.5",
-		input: [{ role: "user", content: "do the thing" }],
+		model: "ignored",
+		input: [{ role: "user", content: "x" }],
 		stream: true,
-		reasoning: { effort: "xhigh", summary: "auto" },
+		reasoning: { effort: "ignored", summary: "auto" },
 	});
 
-	const seenModels: string[] = [];
-	const seenEfforts: string[] = [];
+	const seen: string[] = [];
 
-	for (let turn = 0; turn < 5; turn++) {
-		const rung = chooseRung("executing", 0, turn, [], ladder);
-		assert.ok(rung, `rung should not be null at turn ${turn}`);
+	function fire(mode: "planning" | "executing", stage: number) {
+		const rung = chooseRung(mode, stage, ladder);
+		assert.ok(rung);
 		const out = applyRungToPayload(basePayload(), rung) as {
 			model: string;
 			reasoning: { effort: string };
 		};
-		seenModels.push(out.model);
-		seenEfforts.push(out.reasoning.effort);
+		seen.push(`${out.model}:${out.reasoning.effort}`);
+		return rung;
 	}
 
-	assert.deepEqual(seenModels, [
-		"gpt-5.5",
-		"gpt-5.5",
-		"gpt-5.4",
-		"gpt-5.4",
-		"gpt-5.4", // clamped
+	// /plan → mode=planning, stage=0
+	let mode: "planning" | "executing" = "planning";
+	let stage = 0;
+
+	// Plan run with 3 turns (LLM does some reads, asks for clarification).
+	fire(mode, stage); // turn 1
+	fire(mode, stage); // turn 2
+	fire(mode, stage); // turn 3
+	// agent_end during planning fires the dialog (no stage mutation here).
+
+	// Accept → mode=executing, stage=1, "Execute the plan." auto-prompt fires.
+	mode = "executing";
+	stage = 1;
+
+	// Executing run #1: 4 turns. stage advances at each turn_end.
+	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 1
+	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 2
+	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 3
+	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 4 (clamped)
+
+	// agent_end during executing → reset stage to 0.
+	stage = 0;
+
+	// User follow-up "also do X". Run #2: 3 turns.
+	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 1
+	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 2
+	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 3
+
+	// agent_end → reset.
+	stage = 0;
+
+	// One more follow-up, single turn.
+	fire(mode, stage);
+
+	assert.deepEqual(seen, [
+		// 3 plan turns: all LADDER[0]
+		"gpt-5.5:quick:xhigh",
+		"gpt-5.5:quick:xhigh",
+		"gpt-5.5:quick:xhigh",
+		// Execute the plan run: starts at LADDER[1], steps to [3], then clamps.
+		"gpt-5.5:xhigh",
+		"gpt-5.5:high",
+		"gpt-5.4:high",
+		"gpt-5.4:high", // clamped
+		// Follow-up #1: starts at LADDER[0] (user-facing), steps down.
+		"gpt-5.5:quick:xhigh",
+		"gpt-5.5:xhigh",
+		"gpt-5.5:high",
+		// Follow-up #2 single turn: LADDER[0].
+		"gpt-5.5:quick:xhigh",
 	]);
-	assert.deepEqual(seenEfforts, ["xhigh", "high", "xhigh", "high", "high"]);
 });
