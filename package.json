@@ -1,0 +1,8 @@
+{
+  "name": "pi-model-staging",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "test": "node --test --experimental-strip-types --no-warnings .pi/extensions/plan-stepdown/rewrite.test.ts"
+  }
+}

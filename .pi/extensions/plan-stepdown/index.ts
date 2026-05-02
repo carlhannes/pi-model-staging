@@ -1,78 +1,85 @@
 /**
  * plan-stepdown
  *
- * Plan-then-execute mode for pi, with a hand-rolled "model ladder" that steps
- * the model and/or thinking level down on each agent run (= each user prompt
- * the agent processes).
+ * Plan-then-execute mode for pi with two layers of model "stepping":
  *
- * Two independent ladders, you edit them below:
- *   PLAN_LADDER  — used while you're shaping the plan (read-only tools)
- *   EXEC_LADDER  — used after you accept the plan (full tools)
+ *   PER-RUN ladders   — applied at before_agent_start, swap the actual model
+ *                       (any provider, any API). Advances per user prompt.
+ *   PER-TURN ladders  — applied at before_provider_request, rewrite the wire
+ *                       payload's `model` and reasoning fields. Same provider
+ *                       only (auth/baseUrl are bound to the per-run model).
+ *                       Advances on every LLM call inside one agent run.
  *
- * Each ladder is a list of "rungs". Rung 0 is the first prompt in that phase,
- * rung 1 the second, etc. The last rung repeats forever, so you can keep
- * iterating without falling off the end.
+ * Why two layers:
+ *   pi captures `model` and `reasoning` once per agent run (see
+ *   pi-mono/packages/agent/src/agent.ts:413). Calling pi.setModel() mid-loop
+ *   does not reach the in-flight request. We work around this by rewriting
+ *   the serialized payload at the last possible moment (onPayload, exposed
+ *   to extensions as before_provider_request).
  *
- * Why per-prompt and not per-LLM-call:
- *   pi's agent loop captures `model` and `reasoning` ONCE per run when it
- *   builds AgentLoopConfig (see pi-mono/packages/agent/src/agent.ts:413). The
- *   config is then reused for every turn inside that run. before_agent_start
- *   fires BEFORE that config is built (agent-session.ts:1067-1104), so it's
- *   the only clean seam where a model swap is guaranteed to take effect for
- *   the upcoming run. Stepping down mid-task would also tend to produce worse
- *   output — the model is partway through a coherent piece of work — so this
- *   is also the seam you actually want.
- *
- * Use cases:
- *   - "Priority"/fast provider for planning, slower/cheaper one for execution.
- *   - Burn xhigh thinking on the first execution prompt, step down so cheaper
- *     follow-ups don't pay for full reasoning.
+ * Same-provider constraint:
+ *   The HTTP client is built BEFORE onPayload runs (see e.g.
+ *   pi-mono/packages/ai/src/providers/anthropic.ts:466). It binds baseUrl,
+ *   apiKey, and headers from the original model. Rewriting the payload to
+ *   reference a model on a different provider would still send the request
+ *   to the original provider's endpoint with the original key — wrong.
+ *   Per-turn ladders therefore must keep the same provider; only `modelId`
+ *   and `thinking` should vary.
  *
  * Commands:
- *   /plan          — enter plan mode at PLAN_LADDER[0], lock to read-only tools
- *   /stepdown      — show the current ladder position
- *   /stepdown-off  — leave plan/exec mode and stop swapping models
+ *   /plan          — enter plan mode, top of PLAN ladders, read-only tools
+ *   /stepdown      — show current ladder positions
+ *   /stepdown-off  — leave plan/exec mode, restore full tools
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { ThinkingLevel } from "@mariozechner/pi-ai";
+import type { ThinkingLevel as PiThinkingLevel } from "@mariozechner/pi-ai";
+import { applyRungToPayload, chooseRung, type Mode, type TurnRung } from "./rewrite.js";
 
 // ---------------------------------------------------------------------------
-// Configure your ladders here. Edit freely.
-//
-// `provider` and `modelId` must match what `pi --list-models` prints. Custom
-// providers configured in ~/.pi/agent/models.json work too. Set EXEC_LADDER[0]
-// equal to PLAN_LADDER[0] if you want "first call after plan accepted to use
-// the same model as planning".
+// Per-run ladder: one rung per user prompt. Can change provider freely.
 // ---------------------------------------------------------------------------
 
-type Rung = {
+type RunRung = {
 	provider: string;
 	modelId: string;
-	thinking: ThinkingLevel; // "minimal" | "low" | "medium" | "high" | "xhigh"
+	thinking: PiThinkingLevel;
 };
 
-const PLAN_LADDER: Rung[] = [
-	// Snappy / priority provider while you're shaping the plan.
+const PLAN_RUN_LADDER: RunRung[] = [
 	{ provider: "openai-priority", modelId: "gpt-5.5", thinking: "xhigh" },
 	{ provider: "openai-priority", modelId: "gpt-5.5", thinking: "high" },
 ];
 
-const EXEC_LADDER: Rung[] = [
-	// First exec prompt mirrors plan rung 0 (same model/level), so the model
-	// "carries the thought" into execution. Then we step down.
+const EXEC_RUN_LADDER: RunRung[] = [
 	{ provider: "openai", modelId: "gpt-5.5", thinking: "xhigh" },
 	{ provider: "openai", modelId: "gpt-5.5", thinking: "high" },
 	{ provider: "openai", modelId: "gpt-5.4", thinking: "xhigh" },
 	{ provider: "openai", modelId: "gpt-5.4", thinking: "high" },
 ];
 
-// Tools available during planning. The agent literally cannot edit/write here.
+// ---------------------------------------------------------------------------
+// Per-turn ladder: one rung per LLM call inside a run. Same provider only —
+// see the long comment at the top of this file.
+// ---------------------------------------------------------------------------
+
+const PLAN_TURN_LADDER: TurnRung[] = [
+	{ modelId: "gpt-5.5", thinking: "xhigh" },
+	{ modelId: "gpt-5.5", thinking: "high" },
+	{ modelId: "gpt-5.5", thinking: "medium" },
+];
+
+const EXEC_TURN_LADDER: TurnRung[] = [
+	{ modelId: "gpt-5.5", thinking: "xhigh" },
+	{ modelId: "gpt-5.5", thinking: "high" },
+	{ modelId: "gpt-5.4", thinking: "xhigh" },
+	{ modelId: "gpt-5.4", thinking: "high" },
+];
+
+// Tools available during planning — read-only.
 const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls"];
-// Restored when execution starts.
 const EXEC_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
-// Injected as the first message of each plan/exec run.
 const PLAN_PROMPT = `[PLAN MODE]
 You are in plan mode. Do not modify any files.
 
@@ -85,23 +92,27 @@ Execute the plan you just produced. Edit/write tools are available again.`;
 
 // ---------------------------------------------------------------------------
 
-type Mode = "idle" | "planning" | "executing";
-
 export default function planStepdownExtension(pi: ExtensionAPI): void {
 	let mode: Mode = "idle";
-	// How many runs we've STARTED in each phase (== index of next rung).
+
+	// Per-run counters: index of NEXT rung. Used at before_agent_start.
 	let planRun = 0;
 	let execRun = 0;
 
-	function rungAt(ladder: Rung[], idx: number): Rung {
-		return ladder[Math.min(idx, ladder.length - 1)];
+	// Per-turn counters: reset on agent_start, incremented at turn_end.
+	let planTurn = 0;
+	let execTurn = 0;
+
+	function rungLabel(rung: { provider?: string; modelId: string; thinking: PiThinkingLevel }): string {
+		const prefix = rung.provider ? `${rung.provider}/` : "";
+		return `${prefix}${rung.modelId}:${rung.thinking}`;
 	}
 
-	function rungLabel(r: Rung): string {
-		return `${r.provider}/${r.modelId}:${r.thinking}`;
+	function persist(): void {
+		pi.appendEntry("plan-stepdown-state", { mode, planRun, execRun });
 	}
 
-	async function applyRung(rung: Rung, ctx: ExtensionContext): Promise<boolean> {
+	async function applyRunRung(rung: RunRung, ctx: ExtensionContext): Promise<boolean> {
 		const model = ctx.modelRegistry.find(rung.provider, rung.modelId);
 		if (!model) {
 			ctx.ui.notify(
@@ -119,85 +130,92 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			if (!ok) return false;
 		} catch (err) {
 			ctx.ui.notify(
-				`plan-stepdown: setModel failed for ${rungLabel(rung)}: ${err instanceof Error ? err.message : String(err)}`,
+				`plan-stepdown: setModel failed for ${rungLabel(rung)}: ${
+					err instanceof Error ? err.message : String(err)
+				}`,
 				"error",
 			);
 			return false;
 		}
-		// setModel re-clamps thinking automatically; setting again pins it to
-		// what the rung asked for (still clamped to model capabilities).
 		pi.setThinkingLevel(rung.thinking);
 		return true;
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		if (mode === "planning") {
-			const r = rungAt(PLAN_LADDER, planRun);
-			const idx = Math.min(planRun, PLAN_LADDER.length - 1);
-			ctx.ui.setStatus(
-				"plan-stepdown",
-				ctx.ui.theme.fg("warning", `📋 plan ${idx + 1}/${PLAN_LADDER.length} ${rungLabel(r)}`),
-			);
-		} else if (mode === "executing") {
-			const r = rungAt(EXEC_LADDER, execRun);
-			const idx = Math.min(execRun, EXEC_LADDER.length - 1);
-			ctx.ui.setStatus(
-				"plan-stepdown",
-				ctx.ui.theme.fg("accent", `▶ exec ${idx + 1}/${EXEC_LADDER.length} ${rungLabel(r)}`),
-			);
-		} else {
+		if (mode === "idle") {
 			ctx.ui.setStatus("plan-stepdown", undefined);
+			return;
 		}
-	}
-
-	function persist(): void {
-		pi.appendEntry("plan-stepdown-state", { mode, planRun, execRun });
+		const runLadder = mode === "planning" ? PLAN_RUN_LADDER : EXEC_RUN_LADDER;
+		const turnLadder = mode === "planning" ? PLAN_TURN_LADDER : EXEC_TURN_LADDER;
+		const runIdx = Math.min(mode === "planning" ? planRun : execRun, runLadder.length - 1);
+		const turnIdx = Math.min(mode === "planning" ? planTurn : execTurn, turnLadder.length - 1);
+		const runRung = runLadder[runIdx];
+		const turnRung = turnLadder[turnIdx];
+		const color = mode === "planning" ? "warning" : "accent";
+		const icon = mode === "planning" ? "📋 plan" : "▶ exec";
+		const label =
+			`${icon} run ${runIdx + 1}/${runLadder.length} ${rungLabel(runRung)}` +
+			` · turn ${turnIdx + 1}/${turnLadder.length} ${turnRung.modelId}:${turnRung.thinking}`;
+		ctx.ui.setStatus("plan-stepdown", ctx.ui.theme.fg(color, label));
 	}
 
 	function reset(ctx: ExtensionContext): void {
 		mode = "idle";
 		planRun = 0;
 		execRun = 0;
+		planTurn = 0;
+		execTurn = 0;
 		pi.setActiveTools(EXEC_TOOLS);
 		updateStatus(ctx);
 		persist();
 	}
 
 	// -------------------------------------------------------------------------
-	// /plan — enter plan mode, restrict tools, prepare rung 0 of PLAN_LADDER
+	// /plan: enter plan mode. Tool restriction + status; the actual model swap
+	// happens on the next prompt via before_agent_start.
 	// -------------------------------------------------------------------------
 	pi.registerCommand("plan", {
-		description: "Enter plan mode — read-only tools, top of PLAN_LADDER",
+		description: "Enter plan mode — read-only tools, top of plan ladders",
 		handler: async (_args, ctx) => {
 			mode = "planning";
 			planRun = 0;
 			execRun = 0;
+			planTurn = 0;
+			execTurn = 0;
 			pi.setActiveTools(PLAN_TOOLS);
-			// Don't apply the rung here — before_agent_start will apply it the
-			// moment the user actually submits a prompt. We just stage state.
 			updateStatus(ctx);
 			persist();
 			ctx.ui.notify(
-				`Plan mode ON. Next prompt will use ${rungLabel(rungAt(PLAN_LADDER, 0))}`,
+				`Plan mode ON. Next prompt: run rung ${rungLabel(PLAN_RUN_LADDER[0])} · ` +
+					`turn rung ${PLAN_TURN_LADDER[0].modelId}:${PLAN_TURN_LADDER[0].thinking}`,
 				"info",
 			);
 		},
 	});
 
 	pi.registerCommand("stepdown", {
-		description: "Show current plan-stepdown ladder position",
+		description: "Show plan-stepdown ladder positions",
 		handler: async (_args, ctx) => {
 			if (mode === "idle") {
 				ctx.ui.notify("plan-stepdown: idle. Run /plan to start.", "info");
 				return;
 			}
-			const ladder = mode === "planning" ? PLAN_LADDER : EXEC_LADDER;
-			const idx = Math.min(mode === "planning" ? planRun : execRun, ladder.length - 1);
-			const lines = ladder.map((r, i) => {
-				const marker = i === idx ? "→" : "  ";
-				return `${marker} ${i + 1}. ${rungLabel(r)}`;
-			});
-			ctx.ui.notify(`${mode.toUpperCase()} ladder:\n${lines.join("\n")}`, "info");
+			const runLadder = mode === "planning" ? PLAN_RUN_LADDER : EXEC_RUN_LADDER;
+			const turnLadder = mode === "planning" ? PLAN_TURN_LADDER : EXEC_TURN_LADDER;
+			const runIdx = Math.min(mode === "planning" ? planRun : execRun, runLadder.length - 1);
+			const turnIdx = Math.min(mode === "planning" ? planTurn : execTurn, turnLadder.length - 1);
+			const runLines = runLadder.map(
+				(r, i) => `${i === runIdx ? "→" : "  "} ${i + 1}. ${rungLabel(r)}`,
+			);
+			const turnLines = turnLadder.map(
+				(r, i) => `${i === turnIdx ? "→" : "  "} ${i + 1}. ${r.modelId}:${r.thinking}`,
+			);
+			ctx.ui.notify(
+				`${mode.toUpperCase()} run ladder:\n${runLines.join("\n")}\n\n` +
+					`${mode.toUpperCase()} turn ladder (in-run):\n${turnLines.join("\n")}`,
+				"info",
+			);
 		},
 	});
 
@@ -210,27 +228,24 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	});
 
 	// -------------------------------------------------------------------------
-	// before_agent_start: THE seam. Fires after the user submits a prompt and
-	// before pi builds AgentLoopConfig (which captures model/reasoning for the
-	// whole run). We swap the model here, advance the counter, and inject the
-	// phase-specific nudge.
+	// before_agent_start: applies the per-run rung. Fires before pi builds
+	// AgentLoopConfig (which captures model+reasoning for the whole run).
 	// -------------------------------------------------------------------------
 	pi.on("before_agent_start", async (_event, ctx) => {
 		if (mode === "idle") return;
 
-		const ladder = mode === "planning" ? PLAN_LADDER : EXEC_LADDER;
+		const ladder = mode === "planning" ? PLAN_RUN_LADDER : EXEC_RUN_LADDER;
 		const idx = mode === "planning" ? planRun : execRun;
-		const rung = rungAt(ladder, idx);
+		const clampedIdx = Math.min(idx, ladder.length - 1);
+		const rung = ladder[clampedIdx];
 
-		const ok = await applyRung(rung, ctx);
+		const ok = await applyRunRung(rung, ctx);
 		if (!ok) {
-			// Bad rung — bail to idle so the user gets ONE clear error, not one
-			// per prompt. They can fix the ladder and run /plan again.
 			reset(ctx);
 			return;
 		}
 
-		// Advance ladder so the NEXT prompt picks the next rung.
+		// Advance run counter so NEXT prompt uses the next rung.
 		if (mode === "planning") planRun += 1;
 		else execRun += 1;
 
@@ -238,8 +253,6 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		persist();
 
 		// Inject phase nudge as a custom message on the first run of each phase.
-		// Returning a `message` from before_agent_start prepends it before the
-		// user's actual prompt is processed.
 		if (mode === "planning" && idx === 0) {
 			return {
 				message: { customType: "plan-stepdown-context", content: PLAN_PROMPT, display: false },
@@ -253,10 +266,41 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	});
 
 	// -------------------------------------------------------------------------
-	// agent_end: if we just finished a planning run, ask the user to accept
-	// the plan. On accept, flip to executing and trigger a new agent run with
-	// "Execute the plan." — that fresh run goes through before_agent_start
-	// again and picks up EXEC_LADDER[0].
+	// agent_start: reset per-turn counter at the start of each agent run.
+	// -------------------------------------------------------------------------
+	pi.on("agent_start", async () => {
+		planTurn = 0;
+		execTurn = 0;
+	});
+
+	// -------------------------------------------------------------------------
+	// before_provider_request: THE per-turn seam. Rewrite the wire payload's
+	// model + reasoning to whatever the per-turn ladder says for this turn.
+	// Returning the rewritten payload replaces what gets sent.
+	// -------------------------------------------------------------------------
+	pi.on("before_provider_request", (event) => {
+		const rung = chooseRung(mode, planTurn, execTurn, PLAN_TURN_LADDER, EXEC_TURN_LADDER);
+		if (!rung) return;
+		return applyRungToPayload(event.payload, rung);
+	});
+
+	// -------------------------------------------------------------------------
+	// turn_end: advance per-turn counter so the NEXT turn picks the next rung.
+	// Don't advance on aborted turns so /resume picks up where we left off.
+	// -------------------------------------------------------------------------
+	pi.on("turn_end", async (event, ctx) => {
+		if (mode === "idle") return;
+		const stop =
+			(event.message as { stopReason?: string } | undefined)?.stopReason;
+		if (stop === "aborted") return;
+
+		if (mode === "planning") planTurn += 1;
+		else execTurn += 1;
+		updateStatus(ctx);
+	});
+
+	// -------------------------------------------------------------------------
+	// agent_end: planning run finished — ask the user to accept the plan.
 	// -------------------------------------------------------------------------
 	pi.on("agent_end", async (_event, ctx) => {
 		if (mode !== "planning") return;
@@ -264,13 +308,14 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 		const choice = await ctx.ui.select("Plan ready — what next?", [
 			"Execute the plan",
-			"Refine — stay in plan mode (advances ladder)",
+			"Refine — stay in plan mode (advances ladders)",
 			"Cancel — leave plan mode",
 		]);
 
 		if (choice === "Execute the plan") {
 			mode = "executing";
 			execRun = 0;
+			execTurn = 0;
 			pi.setActiveTools(EXEC_TOOLS);
 			updateStatus(ctx);
 			persist();
@@ -281,14 +326,10 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		} else if (choice === "Cancel — leave plan mode") {
 			reset(ctx);
 		}
-		// Refine: do nothing. Mode stays "planning"; next user prompt advances
-		// PLAN_LADDER. If the user wants to jump back to rung 0 for a refinement,
-		// they can run /plan again.
 	});
 
 	// -------------------------------------------------------------------------
-	// session_start: restore counters across resume so /resume continues from
-	// the right rung.
+	// session_start: restore counters across resume.
 	// -------------------------------------------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
 		const entries = ctx.sessionManager.getEntries();
@@ -297,11 +338,14 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 				(e: { type: string; customType?: string }) =>
 					e.type === "custom" && e.customType === "plan-stepdown-state",
 			)
-			.pop() as { data?: { mode: Mode; planRun: number; execRun: number } } | undefined;
+			.pop() as
+			| { data?: { mode: Mode; planRun: number; execRun: number } }
+			| undefined;
 		if (last?.data) {
 			mode = last.data.mode;
 			planRun = last.data.planRun;
 			execRun = last.data.execRun;
+			// per-turn counters reset on agent_start so we don't restore them.
 			if (mode === "planning") pi.setActiveTools(PLAN_TOOLS);
 			updateStatus(ctx);
 		}
