@@ -89,24 +89,37 @@ included; see commit history if you want the rationale.
 
 ## Install
 
-### As a pi package (recommended)
+**Official install — pinned to the latest release tag:**
 
 ```bash
-# Project-local — adds to .pi/settings.json
-pi install -l git:github.com/carlhannes/pi-model-staging
+# Global (adds to ~/.pi/agent/settings.json)
+pi install git:github.com/carlhannes/pi-model-staging@v0.1.0
 
-# Global — adds to ~/.pi/agent/settings.json
-pi install git:github.com/carlhannes/pi-model-staging
+# Project-local (adds to .pi/settings.json — share with your team)
+pi install -l git:github.com/carlhannes/pi-model-staging@v0.1.0
 
 # Try once without persisting
-pi -e git:github.com/carlhannes/pi-model-staging
+pi -e git:github.com/carlhannes/pi-model-staging@v0.1.0
 ```
 
-Pi reads the `pi.extensions` field from this repo's `package.json` and
-loads the extension automatically. You'll need to fork/edit the ladder in
-`index.ts` for your own model setup — see [Configuration](#configuration).
+Pi clones the repo, reads the `pi.extensions` field from `package.json`,
+and loads the extension automatically. The `@v0.1.0` pins to a specific
+release so `pi update` won't surprise you with breaking changes — drop the
+suffix if you want the latest `main`.
 
-### From a local clone
+After install you'll need to edit the ladder in `index.ts` for your own
+model setup — see [Configuration](#configuration). The simplest way to do
+that is to clone and run from a checkout (next section), or to copy
+`.pi/extensions/plan-stepdown/index.ts` into your own project's
+`.pi/extensions/` directory and edit it there.
+
+### Verify install
+
+Inside `pi`, run `/help` and you should see `/plan`, `/stepdown`, and
+`/stepdown-off`. If they're missing, check `pi --debug` startup logs for
+extension load errors.
+
+### Alternative: from a local clone (recommended for editing the ladder)
 
 ```bash
 git clone https://github.com/carlhannes/pi-model-staging
@@ -115,19 +128,13 @@ cd pi-model-staging
 pi   # auto-discovers .pi/extensions/ when run from the project root
 ```
 
-### Symlink for global use
+### Alternative: symlink for global use
 
 ```bash
 git clone https://github.com/carlhannes/pi-model-staging
 ln -s "$(pwd)/pi-model-staging/.pi/extensions/plan-stepdown" \
       ~/.pi/agent/extensions/plan-stepdown
 ```
-
-### Verify
-
-Inside `pi`, run `/help` and you should see `/plan`, `/stepdown`, and
-`/stepdown-off`. If they're missing, check `pi --debug` startup logs for
-extension load errors.
 
 ## Configuration
 
