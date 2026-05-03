@@ -27,9 +27,12 @@
  *
  * How the swap actually happens:
  *
- *   • setModel() runs exactly twice per plan→exec cycle: once at /plan,
- *     once when you accept the plan. This binds the provider/baseUrl/auth
- *     for the agent run that follows.
+ *   • setModel() runs exactly once per plan→exec cycle, at /plan. Because
+ *     every rung shares PROVIDER, that single binding carries provider /
+ *     baseUrl / auth through plan mode, the auto-injected "Execute the
+ *     plan." run, and any user follow-ups in executing mode. We avoid
+ *     calling setModel again because it persists the model as a default in
+ *     pi settings, which would bounce around per turn.
  *
  *   • before_provider_request rewrites the wire payload's `model` and
  *     `reasoning.effort` (or `reasoning_effort` etc, depending on API) on
@@ -55,13 +58,12 @@
 import { userInfo } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
-	advanceStageAfterTurn,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
-	chooseReasoningBumpIndex,
 	chooseRung,
 	createPromptCacheKey,
 	detectReasoningBump,
+	nextStage,
 	type Mode,
 	type PromptCacheRetention,
 	type ReasoningBumpConfig,
@@ -90,12 +92,16 @@ const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
 
 // One-shot reasoning bump triggers.
 // When a trigger fires, the *next* LLM call in executing mode temporarily uses
-// ladder[1] (or ladder[0] if ladder[1] does not exist).
+// LADDER[BUMP_RUNG_INDEX] (clamped if the ladder is shorter).
 const REASONING_BUMP: ReasoningBumpConfig = {
 	bumpOnFailedBash: true,
 	bumpOnPackageManagerCommand: true,
 	packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
 };
+
+// The rung to bump to. Always ladder[1] (the "first autonomous step" tier),
+// or clamped to the last rung if the ladder is shorter.
+const BUMP_RUNG_INDEX = 1;
 
 const LADDER: Rung[] = [
 	{ modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan mode (every LLM call)
@@ -450,8 +456,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		);
 		if (!reason) return;
 
-		const bumpIndex = chooseReasoningBumpIndex(LADDER);
-		if (bumpIndex === null) return;
+		if (LADDER.length === 0) return;
+		const bumpIndex = Math.min(BUMP_RUNG_INDEX, LADDER.length - 1);
 
 		pendingBump = { rungIndex: bumpIndex, reason };
 		updateStatus(ctx);
@@ -490,12 +496,13 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const stop = (event.message as { stopReason?: string } | undefined)?.stopReason;
 		if (stop === "aborted") return;
 
-		// If a bump was active for this turn, reset the post-turn stage cursor to
-		// the rung after the bump (so a bump on [1] continues at [2]).
+		// If a bump was active for this turn, advance from the bumped rung
+		// (so a bump on [1] continues at [2]). Otherwise advance from the
+		// current stage as normal.
 		const activeBumpIndex = activeBump?.rungIndex;
 		activeBump = null;
 
-		stage = advanceStageAfterTurn(stage, LADDER, activeBumpIndex);
+		stage = nextStage(activeBumpIndex ?? stage, LADDER);
 		updateStatus(ctx);
 		persist();
 	});

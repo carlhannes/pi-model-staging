@@ -19,9 +19,6 @@
             "output": 30,
             "cacheRead": 0.5,
             "cacheWrite": 0
-          },
-          "compat": {
-            "supportsLongCacheRetention": true
           }
         },
         {
@@ -37,9 +34,6 @@
             "output": 30,
             "cacheRead": 0.5,
             "cacheWrite": 0
-          },
-          "compat": {
-            "supportsLongCacheRetention": true
           }
         },
         {
@@ -55,9 +49,6 @@
             "output": 15,
             "cacheRead": 0.25,
             "cacheWrite": 0
-          },
-          "compat": {
-            "supportsLongCacheRetention": true
           }
         },
         {
@@ -73,9 +64,6 @@
             "output": 14,
             "cacheRead": 0.175,
             "cacheWrite": 0
-          },
-          "compat": {
-            "supportsLongCacheRetention": true
           }
         }
       ]

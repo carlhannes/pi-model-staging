@@ -16,11 +16,10 @@ import {
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
-	advanceStageAfterTurn,
-	chooseReasoningBumpIndex,
 	createPromptCacheKey,
 	detectApi,
 	detectReasoningBump,
+	nextStage,
 	startsWithShellCommand,
 	type ReasoningBumpConfig,
 	type Rung,
@@ -274,18 +273,22 @@ test("createPromptCacheKey: hashes username + cwd with visible prefix", () => {
 // applyPromptCacheToPayload — OpenAI prompt caching (augmentation)
 // ============================================================================
 
-test("prompt cache: openai-responses adds prompt_cache_key and prompt_cache_retention when missing", () => {
+test("prompt cache: openai-responses with pi-set key augments retention (the common path)", () => {
+	// Realistic: pi has set prompt_cache_key from sessionId. Our extension
+	// supplies the longer 24h retention on top. Both fields must end up in
+	// the wire payload.
 	const original = {
 		model: "gpt-5.5",
 		input: [{ role: "user", content: "hi" }],
 		stream: true,
+		prompt_cache_key: "pi-session-id-abc",
 	};
-	const out = applyPromptCacheToPayload(original, { key: "session-123", retention: "24h" }) as Record<
+	const out = applyPromptCacheToPayload(original, { key: "should-not-override", retention: "24h" }) as Record<
 		string,
 		unknown
 	>;
-	assert.equal(out.prompt_cache_key, "session-123");
-	assert.equal(out.prompt_cache_retention, "24h");
+	assert.equal(out.prompt_cache_key, "pi-session-id-abc"); // pi's key preserved
+	assert.equal(out.prompt_cache_retention, "24h"); // retention augmented
 	// preserved
 	assert.equal(out.model, "gpt-5.5");
 	assert.deepEqual(out.input, original.input);
@@ -296,10 +299,47 @@ test("prompt cache: openai-completions adds prompt_cache_key only when retention
 		model: "gpt-4o",
 		messages: [{ role: "user", content: "hi" }],
 		stream: true,
+		// pi has set the key but not the retention — partial signal, NOT
+		// "disabled". Augment retention only.
+		prompt_cache_key: "pi-session-existing",
 	};
 	const out = applyPromptCacheToPayload(original, { key: "session-456" }) as Record<string, unknown>;
-	assert.equal(out.prompt_cache_key, "session-456");
+	assert.equal(out.prompt_cache_key, "pi-session-existing");
 	assert.equal(out.prompt_cache_retention, undefined);
+});
+
+test("prompt cache: respects pi-disabled caching (both fields undefined → pass through)", () => {
+	// When pi has cacheRetention: "none" in settings, it leaves BOTH
+	// prompt_cache_key and prompt_cache_retention undefined. We must not
+	// silently re-enable caching by injecting our key — see the comment
+	// in applyPromptCacheToPayload.
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+	};
+	const out = applyPromptCacheToPayload(original, { key: "should-not-be-injected", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, undefined);
+	assert.equal(out.prompt_cache_retention, undefined);
+});
+
+test("prompt cache: pi set retention but not key → augment key only (still treats as enabled)", () => {
+	// Edge: pi set retention but not key. That's not the "disabled" signal
+	// (which is BOTH undefined), so we should still augment the key.
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		prompt_cache_retention: "in_memory",
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-abc", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, "session-abc");
+	assert.equal(out.prompt_cache_retention, "in_memory");
 });
 
 test("prompt cache: preserves existing provider fields (including null)", () => {
@@ -338,29 +378,8 @@ test("prompt cache: does not mutate input", () => {
 });
 
 // ============================================================================
-// Reasoning bumps
+// Reasoning bumps — trigger detection
 // ============================================================================
-
-test("chooseReasoningBumpIndex: empty ladder → null", () => {
-	assert.equal(chooseReasoningBumpIndex([]), null);
-});
-
-test("chooseReasoningBumpIndex: ladder size 1 → 0", () => {
-	assert.equal(
-		chooseReasoningBumpIndex([{ modelId: "only", thinking: "high" }]),
-		0,
-	);
-});
-
-test("chooseReasoningBumpIndex: ladder size >= 2 → 1", () => {
-	assert.equal(
-		chooseReasoningBumpIndex([
-			{ modelId: "r0", thinking: "high" },
-			{ modelId: "r1", thinking: "high" },
-		]),
-		1,
-	);
-});
 
 test("startsWithShellCommand: matches only at start (after whitespace)", () => {
 	assert.equal(startsWithShellCommand("npm test", "npm"), true);
@@ -426,34 +445,26 @@ const STAGE_LADDER: Rung[] = [
 	{ modelId: "r3", thinking: "high" },
 ];
 
-test("advanceStageAfterTurn: normal advancement uses current stage", () => {
-	assert.equal(advanceStageAfterTurn(3, STAGE_LADDER), 3);
-	assert.equal(advanceStageAfterTurn(2, STAGE_LADDER), 3);
+test("nextStage: advances by one, clamped to last rung", () => {
+	assert.equal(nextStage(0, STAGE_LADDER), 1);
+	assert.equal(nextStage(2, STAGE_LADDER), 3);
+	assert.equal(nextStage(3, STAGE_LADDER), 3); // clamped
+	assert.equal(nextStage(99, STAGE_LADDER), 3); // far past end
 });
 
-test("advanceStageAfterTurn: active bump resets post-bump cursor to next rung after bump", () => {
-	assert.equal(advanceStageAfterTurn(3, STAGE_LADDER, 1), 2);
-	assert.equal(advanceStageAfterTurn(99, STAGE_LADDER, 1), 2);
+test("nextStage: post-bump caller passes the bump index — advance from there", () => {
+	// Caller-side composition: nextStage(activeBumpIndex ?? stage, ladder)
+	// A bump on [1] should resume at [2] regardless of where stage was.
+	assert.equal(nextStage(1, STAGE_LADDER), 2);
 });
 
-test("advanceStageAfterTurn: ladder size 1 clamps to 0", () => {
+test("nextStage: ladder size 1 stays at 0", () => {
 	const ladder: Rung[] = [{ modelId: "only", thinking: "high" }];
-	assert.equal(advanceStageAfterTurn(0, ladder), 0);
-	assert.equal(advanceStageAfterTurn(0, ladder, 0), 0);
+	assert.equal(nextStage(0, ladder), 0);
 });
 
-test("advanceStageAfterTurn: ladder size 2 clamps to last rung", () => {
-	const ladder: Rung[] = [
-		{ modelId: "r0", thinking: "high" },
-		{ modelId: "r1", thinking: "high" },
-	];
-	assert.equal(advanceStageAfterTurn(0, ladder), 1);
-	assert.equal(advanceStageAfterTurn(1, ladder), 1);
-	assert.equal(advanceStageAfterTurn(1, ladder, 1), 1);
-});
-
-test("advanceStageAfterTurn: empty ladder returns 0", () => {
-	assert.equal(advanceStageAfterTurn(0, [], 1), 0);
+test("nextStage: empty ladder returns 0", () => {
+	assert.equal(nextStage(5, []), 0);
 });
 
 // ============================================================================
@@ -589,5 +600,87 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 		"gpt-5.5:high",
 		// Follow-up #2 single turn: LADDER[0].
 		"gpt-5.5:quick:xhigh",
+	]);
+});
+
+// ============================================================================
+// End-to-end with reasoning bump: simulate an executing run where a bash
+// failure mid-stream triggers a one-shot bump, then confirm the bumped turn
+// uses LADDER[1] AND the next normal turn resumes at LADDER[2] (not back at
+// the pre-bump stage cursor).
+//
+// State machine (subset relevant here):
+//   tool_result trigger     pendingBump = { rungIndex: BUMP_RUNG_INDEX }
+//   turn_start               activeBump = pendingBump; pendingBump = null
+//   before_provider_request  rung = activeBump ? LADDER[bump] : LADDER[stage]
+//   turn_end                 stage = nextStage(activeBump?.rungIndex ?? stage, ladder)
+//                            activeBump = null
+// ============================================================================
+
+test("end-to-end with bump: bumped turn uses LADDER[1], next turn resumes at LADDER[2]", () => {
+	const ladder: Rung[] = [
+		{ modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] never reached here
+		{ modelId: "gpt-5.5", thinking: "xhigh" }, // [1] post-accept + bump target
+		{ modelId: "gpt-5.5", thinking: "high" }, // [2] post-bump resume
+		{ modelId: "gpt-5.4", thinking: "high" }, // [3]
+	];
+	const BUMP_INDEX = Math.min(1, ladder.length - 1);
+
+	const basePayload = () => ({
+		model: "ignored",
+		input: [{ role: "user", content: "x" }],
+		stream: true,
+		reasoning: { effort: "ignored", summary: "auto" },
+	});
+
+	const seen: string[] = [];
+	let stage = 1; // accept just happened
+	let pendingBump: { rungIndex: number } | null = null;
+	let activeBump: { rungIndex: number } | null = null;
+
+	function fireTurn() {
+		// turn_start: arm the bump if queued.
+		if (pendingBump) {
+			activeBump = pendingBump;
+			pendingBump = null;
+		}
+		// before_provider_request: bump wins over normal stage.
+		const rung = activeBump
+			? ladder[activeBump.rungIndex]
+			: chooseRung("executing", stage, ladder);
+		assert.ok(rung);
+		const out = applyRungToPayload(basePayload(), rung) as {
+			model: string;
+			reasoning: { effort: string };
+		};
+		seen.push(`${out.model}:${out.reasoning.effort}`);
+		// turn_end: advance stage from bump target if there was one.
+		const activeBumpIndex = activeBump?.rungIndex;
+		activeBump = null;
+		stage = nextStage(activeBumpIndex ?? stage, ladder);
+	}
+
+	// Turn 1: normal post-accept turn. Should use LADDER[1].
+	fireTurn();
+
+	// Between turns 2 and 3 the agent ran `npm test` and the result fired a
+	// bump trigger. Queue it before turn 2 starts.
+	pendingBump = { rungIndex: BUMP_INDEX };
+
+	// Turn 2: bump active. Should use LADDER[1] (the bump target).
+	fireTurn();
+
+	// Turn 3: no new bump. Stage was advanced from bump index (1) → 2.
+	// Should use LADDER[2].
+	fireTurn();
+
+	// Turn 4: continues stepping down to LADDER[3].
+	fireTurn();
+
+	assert.deepEqual(seen, [
+		"gpt-5.5:xhigh", // turn 1: LADDER[1] (post-accept default)
+		"gpt-5.5:xhigh", // turn 2: LADDER[1] (bump target — same value here, but bump path used)
+		"gpt-5.5:high", // turn 3: LADDER[2] (resumed AFTER the bump rung, not from pre-bump stage)
+		"gpt-5.4:high", // turn 4: LADDER[3]
 	]);
 });

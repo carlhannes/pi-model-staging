@@ -47,10 +47,12 @@ and reuses them for every turn inside one agent run. Calling
 
 This extension uses two mechanisms together:
 
-1. **`pi.setModel()` once at `/plan`** — binds the provider, baseUrl, and
-   API key for every agent run that follows. We don't call it again, to
-   avoid pi's setModel side-effect of persisting a new default in your
-   settings.
+1. **`pi.setModel()` once per plan→exec cycle, at `/plan`.** Because every
+   rung shares `PROVIDER`, that single binding carries the provider,
+   baseUrl, and API key through plan mode, the auto-injected "Execute the
+   plan." run, and any user follow-ups in executing mode. We deliberately
+   don't call it again — pi persists each `setModel()` as a default in
+   `settings.json`, which would bounce around per turn.
 2. **`before_provider_request` payload rewriting on every LLM call** —
    rewrites the wire payload's `model` and `reasoning_effort` /
    `reasoning.effort` / `output_config.effort` (depending on API) to
@@ -268,6 +270,11 @@ This extension tries to improve cache affinity for OpenAI-compatible backends in
 - It keeps pi/provider-provided cache fields if they already exist.
 - If missing, it injects `prompt_cache_key` based on a stable hash of the local username + current working directory (cwd).
 - It optionally requests extended retention via `prompt_cache_retention: "24h"`.
+- **Respects user opt-out**: if the wire payload arrives with both
+  `prompt_cache_key` AND `prompt_cache_retention` undefined, that's pi
+  signalling caching is disabled (e.g. you set `cacheRetention: "none"`
+  in pi settings). The extension passes the payload through untouched
+  rather than re-enabling what you turned off.
 
 ### Configuration
 
@@ -294,7 +301,7 @@ Check OpenAI usage fields (`cached_tokens`), or in pi watch session stats:
 npm test
 ```
 
-Runs 42 unit tests via Node's built-in test runner with type stripping
+Runs 41 unit tests via Node's built-in test runner with type stripping
 (no extra deps). Coverage:
 
 - API detection: OpenAI Responses / OpenAI Completions / Anthropic adaptive /
@@ -302,12 +309,17 @@ Runs 42 unit tests via Node's built-in test runner with type stripping
 - Payload rewriting per API: model + reasoning swap, no input mutation,
   graceful degradation on unknown payloads
 - `chooseRung` mode/stage dispatch including clamping
-- OpenAI prompt-cache key/retention augmentation
-- Reasoning bump trigger detection and post-bump stage advancement
-- **End-to-end lifecycle**: simulates a full plan run → accept → exec run
-  with stepping → agent_end reset → user follow-up → second reset, and
-  asserts the exact sequence of model + effort values that hits the wire
-  at every LLM call
+- `nextStage` advancement (called from both normal turn_end and post-bump
+  paths)
+- OpenAI prompt-cache key/retention augmentation, including the
+  user-opt-out path
+- Reasoning bump trigger detection (failed bash, package-manager output)
+- **End-to-end lifecycles** (two scenarios):
+  - Plain plan → accept → exec → reset → follow-up, asserting the exact
+    sequence of model + effort values at every LLM call
+  - Bumped path: a `npm test`-style trigger mid-run, asserting the
+    bumped turn uses LADDER[1] and the next normal turn resumes at
+    LADDER[2] (not the pre-bump cursor)
 
 The pure logic lives in [rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts)
 (no pi imports), so tests run without pi or any LLM API keys.
@@ -353,9 +365,9 @@ the plan finishes.
   state is intentionally in-memory only. The state machine resumes correctly
   but the auto-injected `EXEC_FIRST_PROMPT` fires only once per accept, not
   on resume.
-- `setModel()` is called only at `/plan`, so re-entering `/plan` after a
-  long executing session will re-bind the provider but pi's display may
-  still lag for a moment until the next turn.
+- `setModel()` is called only at `/plan` (once per plan→exec cycle), so
+  pi's own model display lags behind the actual rung in flight. Our
+  status widget shows the truth — see Troubleshooting.
 
 ## How this extension is built
 
@@ -367,8 +379,9 @@ If you want to fork or learn from it:
   — pure functions for API detection and payload rewriting. Zero pi
   imports so it's testable in isolation.
 - [.pi/extensions/plan-stepdown/rewrite.test.ts](.pi/extensions/plan-stepdown/rewrite.test.ts)
-  — 42 unit tests with realistic payload fixtures, prompt-cache coverage,
-  reasoning-bump coverage, and full lifecycle simulation.
+  — 41 unit tests with realistic payload fixtures, prompt-cache coverage
+  (including user opt-out), reasoning-bump coverage, and two end-to-end
+  lifecycle simulations (with and without a bump).
 
 The pi APIs used are documented at:
 - [pi extensions guide](https://pi.dev/docs/latest/extensions)

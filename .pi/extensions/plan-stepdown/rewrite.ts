@@ -52,19 +52,15 @@ export function createPromptCacheKey(prefix: string, username: string, cwd: stri
 	return `${prefix}${digest}`;
 }
 
-export function chooseReasoningBumpIndex(ladder: readonly Rung[]): number | null {
-	if (ladder.length === 0) return null;
-	return Math.min(1, ladder.length - 1);
-}
-
-export function advanceStageAfterTurn(
-	stage: number,
-	ladder: readonly Rung[],
-	activeBumpIndex?: number,
-): number {
+/**
+ * Advance the stage cursor by one, clamped to the last rung. The caller
+ * decides what `from` should be — either the current stage (for a normal
+ * turn_end) or the just-active bump's rung index (so post-bump stepping
+ * resumes at the rung *after* the bump rather than wherever stage was).
+ */
+export function nextStage(from: number, ladder: readonly Rung[]): number {
 	if (ladder.length === 0) return 0;
-	const base = activeBumpIndex ?? stage;
-	return Math.min(base + 1, ladder.length - 1);
+	return Math.min(from + 1, ladder.length - 1);
 }
 
 function escapeRegExp(value: string): string {
@@ -222,6 +218,17 @@ export function applyPromptCacheToPayload(payload: unknown, options: PromptCache
 	if (api !== "openai-responses" && api !== "openai-completions") return payload;
 
 	const out: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+
+	// Respect explicit user opt-out. Pi sets prompt_cache_key based on
+	// session id and prompt_cache_retention based on compat config; when both
+	// are undefined here that's pi signalling "caching disabled" (typically
+	// because the user set cacheRetention: "none" in pi settings — see
+	// pi-mono/packages/ai/src/providers/openai-responses.ts:226). Augmenting
+	// in that case would silently re-enable what the user turned off, so we
+	// pass the payload through untouched.
+	const piDisabledCaching =
+		out.prompt_cache_key === undefined && out.prompt_cache_retention === undefined;
+	if (piDisabledCaching) return out;
 
 	if (out.prompt_cache_key === undefined && options.key && options.key.length > 0) {
 		out.prompt_cache_key = options.key;
