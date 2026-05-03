@@ -485,7 +485,7 @@ test("chooseRung: idle → null", () => {
 
 test("chooseRung: empty ladder → null", () => {
 	assert.equal(chooseRung("planning", 0, []), null);
-	assert.equal(chooseRung("executing", 5, []), null);
+	assert.equal(chooseRung("implementing", 5, []), null);
 });
 
 test("chooseRung: planning always returns LADDER[0] regardless of stage", () => {
@@ -494,20 +494,20 @@ test("chooseRung: planning always returns LADDER[0] regardless of stage", () => 
 	assert.deepEqual(chooseRung("planning", 99, LADDER), LADDER[0]);
 });
 
-test("chooseRung: executing returns LADDER[stage]", () => {
-	assert.deepEqual(chooseRung("executing", 0, LADDER), LADDER[0]);
-	assert.deepEqual(chooseRung("executing", 1, LADDER), LADDER[1]);
-	assert.deepEqual(chooseRung("executing", 2, LADDER), LADDER[2]);
-	assert.deepEqual(chooseRung("executing", 3, LADDER), LADDER[3]);
+test("chooseRung: implementing returns LADDER[stage]", () => {
+	assert.deepEqual(chooseRung("implementing", 0, LADDER), LADDER[0]);
+	assert.deepEqual(chooseRung("implementing", 1, LADDER), LADDER[1]);
+	assert.deepEqual(chooseRung("implementing", 2, LADDER), LADDER[2]);
+	assert.deepEqual(chooseRung("implementing", 3, LADDER), LADDER[3]);
 });
 
-test("chooseRung: executing past the end clamps to last", () => {
-	assert.deepEqual(chooseRung("executing", 4, LADDER), LADDER[3]);
-	assert.deepEqual(chooseRung("executing", 99, LADDER), LADDER[3]);
+test("chooseRung: implementing past the end clamps to last", () => {
+	assert.deepEqual(chooseRung("implementing", 4, LADDER), LADDER[3]);
+	assert.deepEqual(chooseRung("implementing", 99, LADDER), LADDER[3]);
 });
 
-test("chooseRung: executing with negative stage clamps to first", () => {
-	assert.deepEqual(chooseRung("executing", -1, LADDER), LADDER[0]);
+test("chooseRung: implementing with negative stage clamps to first", () => {
+	assert.deepEqual(chooseRung("implementing", -1, LADDER), LADDER[0]);
 });
 
 // ============================================================================
@@ -517,10 +517,10 @@ test("chooseRung: executing with negative stage clamps to first", () => {
 // The state machine driving stage transitions lives in index.ts, but the
 // rules are simple enough to encode inline here:
 //
-//   /plan                          mode=planning, stage=0
-//   turn_end during executing      stage = min(stage+1, len-1)
-//   accept                         mode=executing, stage=1
-//   agent_end during executing     stage=0
+//   /plan                              mode=planning, stage=0
+//   turn_end during implementing       stage = min(stage+1, len-1)
+//   accept                             mode=implementing, stage=1
+//   agent_end during implementing      stage=0
 // ============================================================================
 
 test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
@@ -539,7 +539,7 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 
 	const seen: string[] = [];
 
-	function fire(mode: "planning" | "executing", stage: number) {
+	function fire(mode: "planning" | "implementing", stage: number) {
 		const rung = chooseRung(mode, stage, ladder);
 		assert.ok(rung);
 		const out = applyRungToPayload(basePayload(), rung) as {
@@ -551,7 +551,7 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 	}
 
 	// /plan → mode=planning, stage=0
-	let mode: "planning" | "executing" = "planning";
+	let mode: "planning" | "implementing" = "planning";
 	let stage = 0;
 
 	// Plan run with 3 turns (LLM does some reads, asks for clarification).
@@ -560,17 +560,18 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 	fire(mode, stage); // turn 3
 	// agent_end during planning fires the dialog (no stage mutation here).
 
-	// Accept → mode=executing, stage=1, "Execute the plan." auto-prompt fires.
-	mode = "executing";
+	// Accept → mode=implementing, stage=1, "Please start implementation."
+	// auto-prompt fires.
+	mode = "implementing";
 	stage = 1;
 
-	// Executing run #1: 4 turns. stage advances at each turn_end.
+	// Implementing run #1: 4 turns. stage advances at each turn_end.
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 1
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 2
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 3
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 4 (clamped)
 
-	// agent_end during executing → reset stage to 0.
+	// agent_end during implementing → reset stage to 0.
 	stage = 0;
 
 	// User follow-up "also do X". Run #2: 3 turns.
@@ -589,7 +590,7 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 		"gpt-5.5:quick:xhigh",
 		"gpt-5.5:quick:xhigh",
 		"gpt-5.5:quick:xhigh",
-		// Execute the plan run: starts at LADDER[1], steps to [3], then clamps.
+		// Start implementation run: starts at LADDER[1], steps to [3], then clamps.
 		"gpt-5.5:xhigh",
 		"gpt-5.5:high",
 		"gpt-5.4:high",
@@ -604,7 +605,7 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 });
 
 // ============================================================================
-// End-to-end with reasoning bump: simulate an executing run where a bash
+// End-to-end with reasoning bump: simulate an implementing run where a bash
 // failure mid-stream triggers a one-shot bump, then confirm the bumped turn
 // uses LADDER[1] AND the next normal turn resumes at LADDER[2] (not back at
 // the pre-bump stage cursor).
@@ -647,7 +648,7 @@ test("end-to-end with bump: bumped turn uses LADDER[1], next turn resumes at LAD
 		// before_provider_request: bump wins over normal stage.
 		const rung = activeBump
 			? ladder[activeBump.rungIndex]
-			: chooseRung("executing", stage, ladder);
+			: chooseRung("implementing", stage, ladder);
 		assert.ok(rung);
 		const out = applyRungToPayload(basePayload(), rung) as {
 			model: string;

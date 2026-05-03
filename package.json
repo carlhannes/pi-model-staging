@@ -1,7 +1,7 @@
 {
   "name": "pi-model-staging",
   "version": "0.1.0",
-  "description": "A pi extension that adds plan-then-execute mode with a single model ladder. Steps the model and thinking level down as the LLM grinds autonomously, snaps back to the snappy tier when control returns to the user.",
+  "description": "A pi extension that adds plan-then-implement mode with a single model ladder. Steps the model and thinking level down as the LLM grinds autonomously, snaps back to the snappy tier when control returns to the user.",
   "license": "MIT",
   "author": "Carl Hannes <hannes@dealguru.se>",
   "homepage": "https://github.com/carlhannes/pi-model-staging#readme",

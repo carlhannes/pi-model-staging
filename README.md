@@ -1,6 +1,6 @@
 # pi-model-staging
 
-A [pi](https://pi.dev) extension that adds a **plan-then-execute** workflow
+A [pi](https://pi.dev) extension that adds a **plan-then-implement** workflow
 with a **single configurable model ladder**. The model and reasoning level
 step down as the agent grinds through tool calls "by itself", and snap back
 to the snappy/user-facing tier whenever control returns to you.
@@ -24,12 +24,12 @@ const LADDER: Rung[] = [
 | Situation                                                            | Rung used   |
 |----------------------------------------------------------------------|-------------|
 | Plan mode (every LLM call while shaping the plan)                    | `LADDER[0]` |
-| Auto-injected "Execute the plan." run, turn 1                        | `LADDER[1]` |
+| Auto-injected "Please start implementation." run, turn 1             | `LADDER[1]` |
 | Same run, turn 2, 3, ...                                             | step down   |
-| `agent_end` during executing → user gets control back                | reset to 0  |
+| `agent_end` during implementing → user gets control back             | reset to 0  |
 | User follow-up prompt, turn 1 (LLM responding to user, "user-facing")| `LADDER[0]` |
 | Same prompt, turn 2, 3, ... (autonomous tool calls)                  | step down   |
-| Failing bash / npm/pnpm/yarn/bun result during executing             | bump next call to `LADDER[1]`, then continue at `LADDER[2]` |
+| Failing bash / npm/pnpm/yarn/bun result during implementing          | bump next call to `LADDER[1]`, then continue at `LADDER[2]` |
 | Re-entering `/plan`                                                  | `LADDER[0]` |
 
 So `[0]` covers "user is in control or shaping the plan", `[1]` is "first
@@ -47,12 +47,13 @@ and reuses them for every turn inside one agent run. Calling
 
 This extension uses two mechanisms together:
 
-1. **`pi.setModel()` once per plan→exec cycle, at `/plan`.** Because every
-   rung shares `PROVIDER`, that single binding carries the provider,
-   baseUrl, and API key through plan mode, the auto-injected "Execute the
-   plan." run, and any user follow-ups in executing mode. We deliberately
-   don't call it again — pi persists each `setModel()` as a default in
-   `settings.json`, which would bounce around per turn.
+1. **`pi.setModel()` once per plan→implementation cycle, at `/plan`.**
+   Because every rung shares `PROVIDER`, that single binding carries the
+   provider, baseUrl, and API key through plan mode, the auto-injected
+   "Please start implementation." run, and any user follow-ups in
+   implementing mode. We deliberately don't call it again — pi persists
+   each `setModel()` as a default in `settings.json`, which would bounce
+   around per turn.
 2. **`before_provider_request` payload rewriting on every LLM call** —
    rewrites the wire payload's `model` and `reasoning_effort` /
    `reasoning.effort` / `output_config.effort` (depending on API) to
@@ -183,11 +184,11 @@ GPT-5.x model IDs (including `gpt-5.5:quick` for routing to a priority
 tier). Copy into `~/.pi/agent/models.json` (or merge into your existing
 file's `providers` map) and edit `baseUrl` / `apiKey` to match your setup.
 
-### Tools allowed in plan vs execute
+### Tools allowed in plan vs implementation
 
-Edit `PLAN_TOOLS` / `EXEC_TOOLS` in `index.ts` if the defaults don't match
+Edit `PLAN_TOOLS` / `IMPL_TOOLS` in `index.ts` if the defaults don't match
 your tool set. Default plan-mode tools are read-only: `read`, `bash`,
-`grep`, `find`, `ls`. Default execute tools add `edit` and `write`.
+`grep`, `find`, `ls`. Default implementation tools add `edit` and `write`.
 
 ### Reasoning bump triggers
 
@@ -205,7 +206,7 @@ then `[3]`, and so on.
 ### System-prompt nudges
 
 Edit `PLAN_PROMPT` and `EXEC_FIRST_PROMPT` in `index.ts` to change the
-messages that get injected at the start of plan / execute phases.
+messages that get injected at the start of plan / implementation phases.
 
 ## Usage
 
@@ -218,13 +219,13 @@ plan-stepdown: Plan mode ON. Every LLM call uses [0] openai-proxy/gpt-5.5:quick:
 
 [dialog appears]
 Plan ready — what next?
-  > Execute the plan
+  > Start implementation
     Refine — stay in plan mode
     Cancel — leave plan mode
 
-> Execute the plan
-[exec phase begins, first LLM call uses LADDER[1], next [2], next [3], ...
- last rung repeats. When done, status snaps back to LADDER[0]]
+> Start implementation
+[implementation phase begins, first LLM call uses LADDER[1], next [2],
+ next [3], ... last rung repeats. When done, status snaps back to LADDER[0]]
 
 > also add tests for it
 [user follow-up — first LLM call uses LADDER[0] (user-facing), then steps
@@ -240,12 +241,12 @@ The status line at the bottom shows the live cursor:
 |------------------|--------------|
 | `/plan`          | Enter plan mode, restrict to read-only tools, bind provider for the upcoming runs |
 | `/stepdown`      | Print the ladder with the current cursor position |
-| `/stepdown-off`  | Exit plan/execute mode, restore full tools |
+| `/stepdown-off`  | Exit plan/implementation mode, restore full tools |
 
 ### State machine summary
 
 In addition to the stage counter, the extension also supports **one-shot reasoning bumps**
-inside executing mode: when certain tool results arrive (e.g. failing bash, npm/pnpm/yarn/bun
+inside implementing mode: when certain tool results arrive (e.g. failing bash, npm/pnpm/yarn/bun
 output), the *next* LLM call temporarily uses `LADDER[1]` (or `LADDER[0]` if the ladder has
 only one rung). After a bumped turn, the stage cursor continues at the rung *after* the bump (so a bump on `LADDER[1]` continues at `LADDER[2]`).
 
@@ -253,11 +254,11 @@ only one rung). After a bumped turn, the stage cursor continues at the rung *aft
 |----------------------------------------|-----------------------------------------------|
 | `/plan`                                | `mode=planning, stage=0`                      |
 | Every LLM call (planning)              | uses `LADDER[0]` regardless of stage          |
-| Plan accepted                          | `mode=executing, stage=1`                     |
-| `turn_end` during executing            | `stage = min(stage+1, LADDER.length-1)`       |
-| `tool_result` trigger (executing)      | queue bump for next LLM call (resets cursor)  |
+| Plan accepted                          | `mode=implementing, stage=1`                  |
+| `turn_end` during implementing         | `stage = min(stage+1, LADDER.length-1)`       |
+| `tool_result` trigger (implementing)   | queue bump for next LLM call (resets cursor)  |
 | Aborted turn                           | stage NOT advanced (so /resume picks up here) |
-| `agent_end` during executing           | `stage=0` (reset for next user prompt)        |
+| `agent_end` during implementing        | `stage=0` (reset for next user prompt)        |
 | `/plan` again, or `/stepdown-off`      | reset                                         |
 
 ## Prompt caching (OpenAI)
@@ -394,7 +395,7 @@ The pi APIs used are documented at:
 
 The existing upstream
 [plan-mode example](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/examples/extensions/plan-mode)
-is a good reference for the plan/execute UX pattern this extension extends.
+is a good reference for the plan/implementation UX pattern this extension extends.
 
 ## Contributing
 
