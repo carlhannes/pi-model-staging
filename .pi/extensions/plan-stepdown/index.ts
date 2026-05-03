@@ -55,6 +55,7 @@
 import { userInfo } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
+	advanceStageAfterTurn,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseReasoningBumpIndex,
@@ -489,10 +490,12 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const stop = (event.message as { stopReason?: string } | undefined)?.stopReason;
 		if (stop === "aborted") return;
 
-		// Bump is one-shot and ends with the current turn.
+		// If a bump was active for this turn, reset the post-turn stage cursor to
+		// the rung after the bump (so a bump on [1] continues at [2]).
+		const activeBumpIndex = activeBump?.rungIndex;
 		activeBump = null;
 
-		stage = Math.min(stage + 1, LADDER.length - 1);
+		stage = advanceStageAfterTurn(stage, LADDER, activeBumpIndex);
 		updateStatus(ctx);
 		persist();
 	});

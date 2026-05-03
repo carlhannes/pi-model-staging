@@ -229,7 +229,7 @@ The status line at the bottom shows the live cursor:
 In addition to the stage counter, the extension also supports **one-shot reasoning bumps**
 inside executing mode: when certain tool results arrive (e.g. failing bash, npm/pnpm/yarn/bun
 output), the *next* LLM call temporarily uses `LADDER[1]` (or `LADDER[0]` if the ladder has
-only one rung). This does not reset or rewind the stage counter.
+only one rung). After a bumped turn, the stage cursor continues at the rung *after* the bump (so a bump on `LADDER[1]` continues at `LADDER[2]`).
 
 | Event                                  | Stage transition                              |
 |----------------------------------------|-----------------------------------------------|
@@ -237,7 +237,7 @@ only one rung). This does not reset or rewind the stage counter.
 | Every LLM call (planning)              | uses `LADDER[0]` regardless of stage          |
 | Plan accepted                          | `mode=executing, stage=1`                     |
 | `turn_end` during executing            | `stage = min(stage+1, LADDER.length-1)`       |
-| `tool_result` trigger (executing)      | queue one-shot bump for next LLM call         |
+| `tool_result` trigger (executing)      | queue bump for next LLM call (resets cursor)  |
 | Aborted turn                           | stage NOT advanced (so /resume picks up here) |
 | `agent_end` during executing           | `stage=0` (reset for next user prompt)        |
 | `/plan` again, or `/stepdown-off`      | reset                                         |

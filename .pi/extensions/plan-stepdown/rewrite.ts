@@ -57,6 +57,16 @@ export function chooseReasoningBumpIndex(ladder: readonly Rung[]): number | null
 	return Math.min(1, ladder.length - 1);
 }
 
+export function advanceStageAfterTurn(
+	stage: number,
+	ladder: readonly Rung[],
+	activeBumpIndex?: number,
+): number {
+	if (ladder.length === 0) return 0;
+	const base = activeBumpIndex ?? stage;
+	return Math.min(base + 1, ladder.length - 1);
+}
+
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

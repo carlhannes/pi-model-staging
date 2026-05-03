@@ -16,6 +16,7 @@ import {
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
+	advanceStageAfterTurn,
 	chooseReasoningBumpIndex,
 	createPromptCacheKey,
 	detectApi,
@@ -416,6 +417,43 @@ test("detectReasoningBump: no bump for non-matching bash", () => {
 		detectReasoningBump({ toolName: "bash", input: { command: "git status" }, isError: false }, cfg),
 		null,
 	);
+});
+
+const STAGE_LADDER: Rung[] = [
+	{ modelId: "r0", thinking: "high" },
+	{ modelId: "r1", thinking: "high" },
+	{ modelId: "r2", thinking: "high" },
+	{ modelId: "r3", thinking: "high" },
+];
+
+test("advanceStageAfterTurn: normal advancement uses current stage", () => {
+	assert.equal(advanceStageAfterTurn(3, STAGE_LADDER), 3);
+	assert.equal(advanceStageAfterTurn(2, STAGE_LADDER), 3);
+});
+
+test("advanceStageAfterTurn: active bump resets post-bump cursor to next rung after bump", () => {
+	assert.equal(advanceStageAfterTurn(3, STAGE_LADDER, 1), 2);
+	assert.equal(advanceStageAfterTurn(99, STAGE_LADDER, 1), 2);
+});
+
+test("advanceStageAfterTurn: ladder size 1 clamps to 0", () => {
+	const ladder: Rung[] = [{ modelId: "only", thinking: "high" }];
+	assert.equal(advanceStageAfterTurn(0, ladder), 0);
+	assert.equal(advanceStageAfterTurn(0, ladder, 0), 0);
+});
+
+test("advanceStageAfterTurn: ladder size 2 clamps to last rung", () => {
+	const ladder: Rung[] = [
+		{ modelId: "r0", thinking: "high" },
+		{ modelId: "r1", thinking: "high" },
+	];
+	assert.equal(advanceStageAfterTurn(0, ladder), 1);
+	assert.equal(advanceStageAfterTurn(1, ladder), 1);
+	assert.equal(advanceStageAfterTurn(1, ladder, 1), 1);
+});
+
+test("advanceStageAfterTurn: empty ladder returns 0", () => {
+	assert.equal(advanceStageAfterTurn(0, [], 1), 0);
 });
 
 // ============================================================================
