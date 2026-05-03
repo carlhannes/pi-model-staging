@@ -236,6 +236,35 @@ The status line at the bottom shows the live cursor:
 | `agent_end` during executing           | `stage=0` (reset for next user prompt)        |
 | `/plan` again, or `/stepdown-off`      | reset                                         |
 
+## Prompt caching (OpenAI)
+
+OpenAI automatically caches long prompt prefixes, which can reduce latency and input token costs.
+Cache hits require **exact prefix matches** and typically only apply once prompts exceed ~1024 tokens.
+
+This extension tries to improve cache affinity for OpenAI-compatible backends in a conservative way:
+
+- It keeps pi/provider-provided cache fields if they already exist.
+- If missing, it injects `prompt_cache_key` using pi's session id.
+- It optionally requests extended retention via `prompt_cache_retention: "24h"`.
+
+### Configuration
+
+In `.pi/extensions/plan-stepdown/index.ts`:
+
+- `OPENAI_PROMPT_CACHE_RETENTION`: defaults to `"24h"`.
+  - Set it to `undefined` if your proxy rejects the field.
+  - We intentionally do **not** force an explicit in-memory value because different OpenAI SDK versions historically used different spellings (`in_memory` vs `in-memory`).
+
+### Caveats
+
+- Prompt caches are per-organization and per-model/backend. Stepping down across different model IDs (e.g. `gpt-5.5` → `gpt-5.4`) will not share KV cache.
+- If you send >~15 req/min for the same prefix+key, OpenAI may overflow-route and reduce cache effectiveness.
+
+### Monitoring
+
+Check OpenAI usage fields (`cached_tokens`), or in pi watch session stats:
+- `cacheRead` tokens increase on cache hits (for providers that report it).
+
 ## Tests
 
 ```bash

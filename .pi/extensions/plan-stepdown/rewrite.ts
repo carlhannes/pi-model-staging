@@ -13,6 +13,15 @@ export type Rung = {
 	thinking: ThinkingLevel;
 };
 
+export type PromptCacheRetention = "in_memory" | "24h";
+
+export type PromptCacheOptions = {
+	/** Stable affinity key for OpenAI prompt caching. Usually pi's session id. */
+	key?: string;
+	/** Set to "24h" for extended retention, "in_memory" to request default memory retention, or undefined to omit. */
+	retention?: PromptCacheRetention;
+};
+
 export type Mode = "idle" | "planning" | "executing";
 
 export type ApiKind =
@@ -122,6 +131,33 @@ export function applyRungToPayload(payload: unknown, rung: Rung): unknown {
 			break;
 		case "unknown":
 			break;
+	}
+
+	return out;
+}
+
+/**
+ * Add OpenAI prompt-cache affinity fields to a NEW payload object when they
+ * are missing. Existing provider/pi values are preserved, including `null`
+ * (explicitly disabled) and non-empty strings.
+ *
+ * This is intentionally separate from applyRungToPayload(): model/effort
+ * rewriting is the core feature, while prompt caching is a conservative
+ * OpenAI-only augmentation. Non-OpenAI payloads pass through unchanged.
+ */
+export function applyPromptCacheToPayload(payload: unknown, options: PromptCacheOptions): unknown {
+	if (!payload || typeof payload !== "object") return payload;
+	const api = detectApi(payload);
+	if (api !== "openai-responses" && api !== "openai-completions") return payload;
+
+	const out: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+
+	if (out.prompt_cache_key === undefined && options.key && options.key.length > 0) {
+		out.prompt_cache_key = options.key;
+	}
+
+	if (out.prompt_cache_retention === undefined && options.retention) {
+		out.prompt_cache_retention = options.retention;
 	}
 
 	return out;

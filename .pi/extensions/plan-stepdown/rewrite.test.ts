@@ -13,6 +13,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
 	detectApi,
@@ -243,6 +244,73 @@ test("non-object payload: passes through unchanged", () => {
 	assert.equal(applyRungToPayload(null, { modelId: "x", thinking: "high" }), null);
 	assert.equal(applyRungToPayload(undefined, { modelId: "x", thinking: "high" }), undefined);
 	assert.equal(applyRungToPayload("oops", { modelId: "x", thinking: "high" }), "oops");
+});
+
+// ============================================================================
+// applyPromptCacheToPayload — OpenAI prompt caching (augmentation)
+// ============================================================================
+
+test("prompt cache: openai-responses adds prompt_cache_key and prompt_cache_retention when missing", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-123", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, "session-123");
+	assert.equal(out.prompt_cache_retention, "24h");
+	// preserved
+	assert.equal(out.model, "gpt-5.5");
+	assert.deepEqual(out.input, original.input);
+});
+
+test("prompt cache: openai-completions adds prompt_cache_key only when retention omitted", () => {
+	const original = {
+		model: "gpt-4o",
+		messages: [{ role: "user", content: "hi" }],
+		stream: true,
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-456" }) as Record<string, unknown>;
+	assert.equal(out.prompt_cache_key, "session-456");
+	assert.equal(out.prompt_cache_retention, undefined);
+});
+
+test("prompt cache: preserves existing provider fields (including null)", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		prompt_cache_key: null,
+		prompt_cache_retention: "24h",
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-should-not-override", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, null);
+	assert.equal(out.prompt_cache_retention, "24h");
+});
+
+test("prompt cache: non-openai payload passes through unchanged", () => {
+	const original = {
+		model: "gemini",
+		contents: [{ role: "user", parts: [{ text: "hi" }] }],
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-1", retention: "24h" });
+	assert.deepEqual(out, original);
+});
+
+test("prompt cache: does not mutate input", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+	};
+	const snapshot = JSON.parse(JSON.stringify(original));
+	applyPromptCacheToPayload(original, { key: "session-123", retention: "24h" });
+	assert.deepEqual(original, snapshot);
 });
 
 // ============================================================================

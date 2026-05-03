@@ -53,7 +53,14 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { applyRungToPayload, chooseRung, type Mode, type Rung } from "./rewrite.js";
+import {
+	applyPromptCacheToPayload,
+	applyRungToPayload,
+	chooseRung,
+	type Mode,
+	type PromptCacheRetention,
+	type Rung,
+} from "./rewrite.js";
 
 // ---------------------------------------------------------------------------
 // Configure here. Edit freely.
@@ -64,6 +71,14 @@ import { applyRungToPayload, chooseRung, type Mode, type Rung } from "./rewrite.
 // ---------------------------------------------------------------------------
 
 const PROVIDER = "openai-proxy";
+
+// Conservative OpenAI prompt-cache augmentation.
+// - key: defaults to pi's session id (good cache affinity without extra state)
+// - retention: use "24h" for GPT-5.x / gpt-4.1 direct OpenAI-compatible backends,
+//   or set to undefined if your proxy rejects the field.
+// We intentionally OMIT explicit in-memory retention to stay compatible with
+// both older and newer OpenAI SDK/type spellings.
+const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
 
 const LADDER: Rung[] = [
 	{ modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan mode (every LLM call)
@@ -360,10 +375,23 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// payload's model + reasoning to LADDER[active]. Returning the
 	// rewritten payload replaces what gets sent.
 	// -------------------------------------------------------------------------
-	pi.on("before_provider_request", (event) => {
+	pi.on("before_provider_request", (event, ctx) => {
 		const rung = chooseRung(mode, stage, LADDER);
 		if (!rung) return;
-		return applyRungToPayload(event.payload, rung);
+
+		let payload = applyRungToPayload(event.payload, rung);
+		const model = ctx.modelRegistry.find(PROVIDER, rung.modelId);
+		const supportsLongCacheRetention = model?.compat?.supportsLongCacheRetention ?? true;
+		const promptCacheRetention =
+			OPENAI_PROMPT_CACHE_RETENTION === "24h" && !supportsLongCacheRetention
+				? undefined
+				: OPENAI_PROMPT_CACHE_RETENTION;
+
+		payload = applyPromptCacheToPayload(payload, {
+			key: ctx.sessionManager.getSessionId(),
+			retention: promptCacheRetention,
+		});
+		return payload;
 	});
 
 	// -------------------------------------------------------------------------
