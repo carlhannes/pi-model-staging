@@ -244,13 +244,14 @@ Cache hits require **exact prefix matches** and typically only apply once prompt
 This extension tries to improve cache affinity for OpenAI-compatible backends in a conservative way:
 
 - It keeps pi/provider-provided cache fields if they already exist.
-- If missing, it injects `prompt_cache_key` using pi's session id.
+- If missing, it injects `prompt_cache_key` based on a stable hash of the local username + current working directory (cwd).
 - It optionally requests extended retention via `prompt_cache_retention: "24h"`.
 
 ### Configuration
 
 In `.pi/extensions/plan-stepdown/index.ts`:
 
+- `OPENAI_PROMPT_CACHE_KEY_PREFIX`: defaults to `"pi-model-staging:"`.
 - `OPENAI_PROMPT_CACHE_RETENTION`: defaults to `"24h"`.
   - Set it to `undefined` if your proxy rejects the field.
   - We intentionally do **not** force an explicit in-memory value because different OpenAI SDK versions historically used different spellings (`in_memory` vs `in-memory`).

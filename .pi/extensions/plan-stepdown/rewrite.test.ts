@@ -16,6 +16,7 @@ import {
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
+	createPromptCacheKey,
 	detectApi,
 	type Rung,
 } from "./rewrite.ts";
@@ -244,6 +245,24 @@ test("non-object payload: passes through unchanged", () => {
 	assert.equal(applyRungToPayload(null, { modelId: "x", thinking: "high" }), null);
 	assert.equal(applyRungToPayload(undefined, { modelId: "x", thinking: "high" }), undefined);
 	assert.equal(applyRungToPayload("oops", { modelId: "x", thinking: "high" }), "oops");
+});
+
+// ============================================================================
+// createPromptCacheKey
+// ============================================================================
+
+test("createPromptCacheKey: hashes username + cwd with visible prefix", () => {
+	const a = createPromptCacheKey("pi-model-staging:", "alice", "/repo/a");
+	const b = createPromptCacheKey("pi-model-staging:", "alice", "/repo/a");
+	const c = createPromptCacheKey("pi-model-staging:", "alice", "/repo/b");
+	const d = createPromptCacheKey("pi-model-staging:", "bob", "/repo/a");
+
+	assert.equal(a, b);
+	assert.match(a, /^pi-model-staging:[0-9a-f]{32}$/);
+	assert.notEqual(a, c);
+	assert.notEqual(a, d);
+	assert.ok(!a.includes("alice"));
+	assert.ok(!a.includes("/repo/a"));
 });
 
 // ============================================================================

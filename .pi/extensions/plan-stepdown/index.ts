@@ -52,11 +52,13 @@
  *   /stepdown-off  — leave plan/exec mode, restore full tools
  */
 
+import { userInfo } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
+	createPromptCacheKey,
 	type Mode,
 	type PromptCacheRetention,
 	type Rung,
@@ -73,11 +75,13 @@ import {
 const PROVIDER = "openai-proxy";
 
 // Conservative OpenAI prompt-cache augmentation.
-// - key: defaults to pi's session id (good cache affinity without extra state)
+// - key: stable hash of local username + cwd, with a project-specific prefix
+//   outside the hash so raw local details are not sent to the provider.
 // - retention: use "24h" for GPT-5.x / gpt-4.1 direct OpenAI-compatible backends,
 //   or set to undefined if your proxy rejects the field.
 // We intentionally OMIT explicit in-memory retention to stay compatible with
 // both older and newer OpenAI SDK/type spellings.
+const OPENAI_PROMPT_CACHE_KEY_PREFIX = "pi-model-staging:";
 const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
 
 const LADDER: Rung[] = [
@@ -248,6 +252,20 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		pi.appendEntry("plan-stepdown-state", { mode, stage });
 	}
 
+	function getLocalUsername(): string {
+		try {
+			const username = userInfo().username;
+			if (username) return username;
+		} catch {
+			// Fall back below. userInfo() can fail in restricted environments.
+		}
+		return process.env.USER || process.env.USERNAME || process.env.LOGNAME || "unknown";
+	}
+
+	function getPromptCacheKey(ctx: ExtensionContext): string {
+		return createPromptCacheKey(OPENAI_PROMPT_CACHE_KEY_PREFIX, getLocalUsername(), ctx.cwd);
+	}
+
 	function updateStatus(ctx: ExtensionContext): void {
 		if (mode === "idle") {
 			ctx.ui.setStatus("plan-stepdown", undefined);
@@ -388,7 +406,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 				: OPENAI_PROMPT_CACHE_RETENTION;
 
 		payload = applyPromptCacheToPayload(payload, {
-			key: ctx.sessionManager.getSessionId(),
+			key: getPromptCacheKey(ctx),
 			retention: promptCacheRetention,
 		});
 		return payload;

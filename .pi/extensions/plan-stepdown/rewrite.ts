@@ -6,6 +6,8 @@
  * fields on a copy. Same-provider only — see README.
  */
 
+import { createHash } from "node:crypto";
+
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export type Rung = {
@@ -23,6 +25,17 @@ export type PromptCacheOptions = {
 };
 
 export type Mode = "idle" | "planning" | "executing";
+
+/**
+ * Build a stable OpenAI prompt-cache affinity key for this local project.
+ *
+ * The namespace/prefix is deliberately outside the hash so provider logs can
+ * identify this extension's keys without exposing the raw username or path.
+ */
+export function createPromptCacheKey(prefix: string, username: string, cwd: string): string {
+	const digest = createHash("sha256").update(username).update("\0").update(cwd).digest("hex").slice(0, 32);
+	return `${prefix}${digest}`;
+}
 
 export type ApiKind =
 	| "openai-responses"
