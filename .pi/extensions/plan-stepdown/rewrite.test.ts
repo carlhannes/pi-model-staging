@@ -16,8 +16,12 @@ import {
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
+	chooseReasoningBumpIndex,
 	createPromptCacheKey,
 	detectApi,
+	detectReasoningBump,
+	startsWithShellCommand,
+	type ReasoningBumpConfig,
 	type Rung,
 } from "./rewrite.ts";
 
@@ -330,6 +334,88 @@ test("prompt cache: does not mutate input", () => {
 	const snapshot = JSON.parse(JSON.stringify(original));
 	applyPromptCacheToPayload(original, { key: "session-123", retention: "24h" });
 	assert.deepEqual(original, snapshot);
+});
+
+// ============================================================================
+// Reasoning bumps
+// ============================================================================
+
+test("chooseReasoningBumpIndex: empty ladder → null", () => {
+	assert.equal(chooseReasoningBumpIndex([]), null);
+});
+
+test("chooseReasoningBumpIndex: ladder size 1 → 0", () => {
+	assert.equal(
+		chooseReasoningBumpIndex([{ modelId: "only", thinking: "high" }]),
+		0,
+	);
+});
+
+test("chooseReasoningBumpIndex: ladder size >= 2 → 1", () => {
+	assert.equal(
+		chooseReasoningBumpIndex([
+			{ modelId: "r0", thinking: "high" },
+			{ modelId: "r1", thinking: "high" },
+		]),
+		1,
+	);
+});
+
+test("startsWithShellCommand: matches only at start (after whitespace)", () => {
+	assert.equal(startsWithShellCommand("npm test", "npm"), true);
+	assert.equal(startsWithShellCommand("  npm   run build", "npm"), true);
+	assert.equal(startsWithShellCommand("npm", "npm"), true);
+	assert.equal(startsWithShellCommand("pnpm test", "npm"), false);
+	assert.equal(startsWithShellCommand("echo npm test", "npm"), false);
+	assert.equal(startsWithShellCommand("cd x && npm test", "npm"), false);
+});
+
+test("detectReasoningBump: bumps on failed bash", () => {
+	const cfg: ReasoningBumpConfig = {
+		bumpOnFailedBash: true,
+		bumpOnPackageManagerCommand: true,
+		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+	};
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: true }, cfg),
+		"failed bash command",
+	);
+});
+
+test("detectReasoningBump: bumps on npm output even when successful", () => {
+	const cfg: ReasoningBumpConfig = {
+		bumpOnFailedBash: true,
+		bumpOnPackageManagerCommand: true,
+		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+	};
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: false }, cfg),
+		"npm command result",
+	);
+});
+
+test("detectReasoningBump: bumps on other package managers", () => {
+	const cfg: ReasoningBumpConfig = {
+		bumpOnFailedBash: true,
+		bumpOnPackageManagerCommand: true,
+		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+	};
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "pnpm test" }, isError: false }, cfg),
+		"pnpm command result",
+	);
+});
+
+test("detectReasoningBump: no bump for non-matching bash", () => {
+	const cfg: ReasoningBumpConfig = {
+		bumpOnFailedBash: true,
+		bumpOnPackageManagerCommand: true,
+		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+	};
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "git status" }, isError: false }, cfg),
+		null,
+	);
 });
 
 // ============================================================================

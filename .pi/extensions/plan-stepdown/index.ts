@@ -57,10 +57,13 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import {
 	applyPromptCacheToPayload,
 	applyRungToPayload,
+	chooseReasoningBumpIndex,
 	chooseRung,
 	createPromptCacheKey,
+	detectReasoningBump,
 	type Mode,
 	type PromptCacheRetention,
+	type ReasoningBumpConfig,
 	type Rung,
 } from "./rewrite.js";
 
@@ -83,6 +86,15 @@ const PROVIDER = "openai-proxy";
 // both older and newer OpenAI SDK/type spellings.
 const OPENAI_PROMPT_CACHE_KEY_PREFIX = "pi-model-staging:";
 const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
+
+// One-shot reasoning bump triggers.
+// When a trigger fires, the *next* LLM call in executing mode temporarily uses
+// ladder[1] (or ladder[0] if ladder[1] does not exist).
+const REASONING_BUMP: ReasoningBumpConfig = {
+	bumpOnFailedBash: true,
+	bumpOnPackageManagerCommand: true,
+	packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+};
 
 const LADDER: Rung[] = [
 	{ modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan mode (every LLM call)
@@ -238,6 +250,10 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// incremented at every turn_end during executing (clamped to ladder end).
 	let stage = 0;
 
+	// One-shot bump state.
+	let pendingBump: { rungIndex: number; reason: string } | null = null;
+	let activeBump: { rungIndex: number; reason: string } | null = null;
+
 	function rungLabel(rung: Rung, idx: number): string {
 		return `[${idx}] ${PROVIDER}/${rung.modelId}:${rung.thinking}`;
 	}
@@ -246,6 +262,13 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (mode === "idle") return -1;
 		if (mode === "planning") return 0;
 		return Math.min(stage, LADDER.length - 1);
+	}
+
+	function effectiveRungIndexForStatus(): number {
+		if (mode === "idle") return -1;
+		if (mode === "planning") return 0;
+		if (activeBump) return activeBump.rungIndex;
+		return activeRungIndex();
 	}
 
 	function persist(): void {
@@ -271,11 +294,21 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			ctx.ui.setStatus("plan-stepdown", undefined);
 			return;
 		}
-		const idx = activeRungIndex();
+		const idx = effectiveRungIndexForStatus();
 		const rung = LADDER[idx];
 		const color = mode === "planning" ? "warning" : "accent";
 		const icon = mode === "planning" ? "📋 plan" : "▶ exec";
-		const label = `${icon} ${rungLabel(rung, idx)} (${idx + 1}/${LADDER.length})`;
+
+		let suffix = "";
+		if (mode === "executing") {
+			if (activeBump) {
+				suffix = ` ↑ ${activeBump.reason}`;
+			} else if (pendingBump) {
+				suffix = ` next↑ ${pendingBump.reason}`;
+			}
+		}
+
+		const label = `${icon} ${rungLabel(rung, idx)} (${idx + 1}/${LADDER.length})${suffix}`;
 		ctx.ui.setStatus("plan-stepdown", ctx.ui.theme.fg(color, label));
 	}
 
@@ -313,6 +346,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	function reset(ctx: ExtensionContext): void {
 		mode = "idle";
 		stage = 0;
+		pendingBump = null;
+		activeBump = null;
 		pi.setActiveTools(EXEC_TOOLS);
 		updateStatus(ctx);
 		persist();
@@ -326,6 +361,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			mode = "planning";
 			stage = 0;
+			pendingBump = null;
+			activeBump = null;
 			pi.setActiveTools(PLAN_TOOLS);
 			const ok = await bindProviderForRung(LADDER[0], ctx);
 			if (!ok) {
@@ -389,12 +426,43 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	});
 
 	// -------------------------------------------------------------------------
+	// turn_start: if a bump is queued, arm it for this turn.
+	// -------------------------------------------------------------------------
+	pi.on("turn_start", async (_event, ctx) => {
+		if (mode !== "executing") return;
+		if (!pendingBump) return;
+		activeBump = pendingBump;
+		pendingBump = null;
+		updateStatus(ctx);
+	});
+
+	// -------------------------------------------------------------------------
+	// tool_result: detect important outputs/errors and queue a one-shot bump for
+	// the *next* LLM call.
+	// -------------------------------------------------------------------------
+	pi.on("tool_result", async (event, ctx) => {
+		if (mode !== "executing") return;
+
+		const reason = detectReasoningBump(
+			{ toolName: event.toolName, input: event.input, isError: event.isError },
+			REASONING_BUMP,
+		);
+		if (!reason) return;
+
+		const bumpIndex = chooseReasoningBumpIndex(LADDER);
+		if (bumpIndex === null) return;
+
+		pendingBump = { rungIndex: bumpIndex, reason };
+		updateStatus(ctx);
+	});
+
+	// -------------------------------------------------------------------------
 	// before_provider_request: THE per-LLM-call seam. Rewrite the wire
 	// payload's model + reasoning to LADDER[active]. Returning the
 	// rewritten payload replaces what gets sent.
 	// -------------------------------------------------------------------------
 	pi.on("before_provider_request", (event, ctx) => {
-		const rung = chooseRung(mode, stage, LADDER);
+		const rung = activeBump ? LADDER[activeBump.rungIndex] : chooseRung(mode, stage, LADDER);
 		if (!rung) return;
 
 		let payload = applyRungToPayload(event.payload, rung);
@@ -421,6 +489,9 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const stop = (event.message as { stopReason?: string } | undefined)?.stopReason;
 		if (stop === "aborted") return;
 
+		// Bump is one-shot and ends with the current turn.
+		activeBump = null;
+
 		stage = Math.min(stage + 1, LADDER.length - 1);
 		updateStatus(ctx);
 		persist();
@@ -441,6 +512,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	pi.on("agent_end", async (_event, ctx) => {
 		if (mode === "executing") {
 			stage = 0;
+			pendingBump = null;
+			activeBump = null;
 			updateStatus(ctx);
 			persist();
 			return;
@@ -458,6 +531,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (choice === "Execute the plan") {
 			mode = "executing";
 			stage = 1;
+			pendingBump = null;
+			activeBump = null;
 			pi.setActiveTools(EXEC_TOOLS);
 			updateStatus(ctx);
 			persist();
@@ -485,6 +560,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (last?.data) {
 			mode = last.data.mode;
 			stage = last.data.stage;
+			pendingBump = null;
+			activeBump = null;
 			if (mode === "planning") pi.setActiveTools(PLAN_TOOLS);
 			updateStatus(ctx);
 		}

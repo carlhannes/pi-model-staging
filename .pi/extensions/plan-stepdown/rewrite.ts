@@ -24,6 +24,21 @@ export type PromptCacheOptions = {
 	retention?: PromptCacheRetention;
 };
 
+export type ReasoningBumpConfig = {
+	/** Bump reasoning for the next LLM call when a bash command fails (non-zero exit, timeout, etc.). */
+	bumpOnFailedBash: boolean;
+	/** Bump reasoning for the next LLM call when a package-manager command output must be interpreted. */
+	bumpOnPackageManagerCommand: boolean;
+	/** Which executables count as package managers (matched at the start of the bash command). */
+	packageManagerCommands: readonly string[];
+};
+
+export type ToolResultForBump = {
+	toolName: string;
+	input?: Record<string, unknown>;
+	isError: boolean;
+};
+
 export type Mode = "idle" | "planning" | "executing";
 
 /**
@@ -35,6 +50,39 @@ export type Mode = "idle" | "planning" | "executing";
 export function createPromptCacheKey(prefix: string, username: string, cwd: string): string {
 	const digest = createHash("sha256").update(username).update("\0").update(cwd).digest("hex").slice(0, 32);
 	return `${prefix}${digest}`;
+}
+
+export function chooseReasoningBumpIndex(ladder: readonly Rung[]): number | null {
+	if (ladder.length === 0) return null;
+	return Math.min(1, ladder.length - 1);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function startsWithShellCommand(command: string, executable: string): boolean {
+	const trimmed = command.trimStart();
+	if (!trimmed) return false;
+	const pattern = new RegExp(`^${escapeRegExp(executable)}(?:$|[\\s;&|()<>])`);
+	return pattern.test(trimmed);
+}
+
+export function detectReasoningBump(event: ToolResultForBump, config: ReasoningBumpConfig): string | null {
+	// Priority: failures first (most important to recover correctly).
+	if (event.toolName === "bash") {
+		const command = typeof event.input?.command === "string" ? event.input.command : undefined;
+		if (config.bumpOnFailedBash && event.isError) return "failed bash command";
+
+		if (command && config.bumpOnPackageManagerCommand) {
+			const pm = config.packageManagerCommands.find((name) => startsWithShellCommand(command, name));
+			if (pm) return `${pm} command result`;
+		}
+
+		return null;
+	}
+
+	return null;
 }
 
 export type ApiKind =
