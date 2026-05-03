@@ -13,6 +13,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	applyOpenAIWebSearchToPayload,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
@@ -270,6 +271,112 @@ test("createPromptCacheKey: hashes username + cwd with visible prefix", () => {
 });
 
 // ============================================================================
+// applyOpenAIWebSearchToPayload — OpenAI Responses hosted web search
+// ============================================================================
+
+test("web search: openai-responses appends web_search tool and sets tool_choice auto", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+		tools: [{ type: "function", name: "read", parameters: {} }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "medium" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.model, "gpt-5.5");
+	assert.equal(out.tool_choice, "auto");
+	assert.ok(Array.isArray(out.tools));
+	const tools = out.tools as Array<Record<string, unknown>>;
+	assert.equal(tools.length, 2);
+	assert.equal(tools[0]?.type, "function");
+	assert.equal(tools[1]?.type, "web_search");
+	assert.equal(tools[1]?.search_context_size, "medium");
+});
+
+test("web search: preserves existing tool_choice", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tool_choice: "required",
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "low" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.tool_choice, "required");
+});
+
+test("web search: disabled option and non-object payloads pass through unchanged", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	assert.deepEqual(applyOpenAIWebSearchToPayload(original, { enabled: false, contextSize: "high" }), original);
+	assert.equal(applyOpenAIWebSearchToPayload(null, { enabled: true, contextSize: "high" }), null);
+	assert.equal(applyOpenAIWebSearchToPayload("oops", { enabled: true, contextSize: "high" }), "oops");
+});
+
+test("web search: does not duplicate if web_search already present", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tools: [{ type: "web_search", search_context_size: "low" }],
+		tool_choice: "auto",
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "high" }) as Record<
+		string,
+		unknown
+	>;
+	assert.ok(Array.isArray(out.tools));
+	assert.equal((out.tools as unknown[]).length, 1);
+});
+
+test("web search: does not duplicate if web_search_preview already present", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tools: [{ type: "web_search_preview" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "high" }) as Record<
+		string,
+		unknown
+	>;
+	assert.ok(Array.isArray(out.tools));
+	assert.equal((out.tools as unknown[]).length, 1);
+});
+
+test("web search: openai-completions payload unchanged", () => {
+	const original = {
+		model: "gpt-4o",
+		messages: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "high" });
+	assert.deepEqual(out, original);
+});
+
+test("web search: contextSize off disables injection", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "off" });
+	assert.deepEqual(out, original);
+});
+
+test("web search: does not mutate input", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tools: [{ type: "function", name: "read", parameters: {} }],
+	};
+	const snapshot = JSON.parse(JSON.stringify(original));
+	applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "low" });
+	assert.deepEqual(original, snapshot);
+});
+
+// ============================================================================
 // applyPromptCacheToPayload — OpenAI prompt caching (augmentation)
 // ============================================================================
 
@@ -511,7 +618,7 @@ test("chooseRung: implementing with negative stage clamps to first", () => {
 });
 
 // ============================================================================
-// End-to-end lifecycle: simulate the full plan→exec→follow-up flow and
+// End-to-end lifecycle: simulate the full plan→implement→follow-up flow and
 // confirm each LLM call gets the right rung's model + effort.
 //
 // The state machine driving stage transitions lives in index.ts, but the
@@ -525,10 +632,10 @@ test("chooseRung: implementing with negative stage clamps to first", () => {
 
 test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 	const ladder: Rung[] = [
-		{ modelId: "gpt-5.5:quick", thinking: "xhigh" },
-		{ modelId: "gpt-5.5", thinking: "xhigh" },
-		{ modelId: "gpt-5.5", thinking: "high" },
-		{ modelId: "gpt-5.4", thinking: "high" },
+		{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" },
+		{ modelId: "gpt-5.5", thinking: "xhigh", webSearchContextSize: "high" },
+		{ modelId: "gpt-5.5", thinking: "high", webSearchContextSize: "medium" },
+		{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "low" },
 	];
 	const basePayload = () => ({
 		model: "ignored",
@@ -538,15 +645,26 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 	});
 
 	const seen: string[] = [];
+	const seenSearch: Array<string | undefined> = [];
 
 	function fire(mode: "planning" | "implementing", stage: number) {
 		const rung = chooseRung(mode, stage, ladder);
 		assert.ok(rung);
-		const out = applyRungToPayload(basePayload(), rung) as {
+		const out = applyRungToPayload(basePayload(), rung) as Record<string, unknown> & {
 			model: string;
 			reasoning: { effort: string };
 		};
 		seen.push(`${out.model}:${out.reasoning.effort}`);
+
+		// Web search context size follows the rung's setting.
+		const withSearch = applyOpenAIWebSearchToPayload(out, {
+			enabled: true,
+			contextSize: rung.webSearchContextSize,
+		}) as Record<string, unknown>;
+		const tools = (withSearch.tools as Array<Record<string, unknown>> | undefined) ?? [];
+		const ws = tools.find((t) => t?.type === "web_search");
+		seenSearch.push(ws ? String(ws.search_context_size) : undefined);
+
 		return rung;
 	}
 
@@ -601,6 +719,24 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 		"gpt-5.5:high",
 		// Follow-up #2 single turn: LADDER[0].
 		"gpt-5.5:quick:xhigh",
+	]);
+
+	assert.deepEqual(seenSearch, [
+		// Plan run: LADDER[0] repeated.
+		"high",
+		"high",
+		"high",
+		// Start implementation run: [1] → [2] → [3] → [3] clamped.
+		"high",
+		"medium",
+		"low",
+		"low",
+		// Follow-up #1: [0] → [1] → [2].
+		"high",
+		"high",
+		"medium",
+		// Follow-up #2: [0].
+		"high",
 	]);
 });
 

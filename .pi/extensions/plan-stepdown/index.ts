@@ -59,6 +59,7 @@
 import { userInfo } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
+	applyOpenAIWebSearchToPayload,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
@@ -90,6 +91,7 @@ const PROVIDER = "openai-proxy";
 // both older and newer OpenAI SDK/type spellings.
 const OPENAI_PROMPT_CACHE_KEY_PREFIX = "pi-model-staging:";
 const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
+const OPENAI_WEB_SEARCH_ENABLED = process.env.PI_OPENAI_WEB_SEARCH !== "0";
 
 // One-shot reasoning bump triggers.
 // When a trigger fires, the *next* LLM call in implementing mode temporarily
@@ -105,11 +107,11 @@ const REASONING_BUMP: ReasoningBumpConfig = {
 const BUMP_RUNG_INDEX = 1;
 
 const LADDER: Rung[] = [
-	{ modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan mode (every LLM call)
-	{ modelId: "gpt-5.5", thinking: "xhigh" }, // [1] first call after plan accepted
-	{ modelId: "gpt-5.5", thinking: "high" }, // [2]
-	{ modelId: "gpt-5.4", thinking: "high" }, // [3]
-	{ modelId: "gpt-5.2", thinking: "high" }, // [4]+ (clamps here forever)
+	{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" }, // [0] plan mode (every LLM call)
+	{ modelId: "gpt-5.5", thinking: "xhigh", webSearchContextSize: "high" }, // [1] first call after plan accepted
+	{ modelId: "gpt-5.5", thinking: "high", webSearchContextSize: "medium" }, // [2]
+	{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "low" }, // [3]
+	{ modelId: "gpt-5.2", thinking: "high", webSearchContextSize: "low" }, // [4]+ (clamps here forever)
 ];
 
 // Tools available during planning — read-only.
@@ -125,8 +127,8 @@ perspectives. You're collaborating on this codebase together.
 
 Be humble and questioning. Practice thinking before talking. Be completely
 honest at all times, state your assumptions, and if you're uncertain say
-so — and if possible, look it up via file search or web search (web is via
-\`bash\` + \`curl\` in this environment).
+so — and if possible, look it up via file search, native OpenAI web search
+when available, or \`bash\` + \`curl\` as a fallback.
 
 # Principles (apply throughout, with reasonable exceptions)
 
@@ -170,7 +172,8 @@ In PLAN MODE you do Research & Analysis ONLY:
 * Read files and examine code (\`read\`)
 * Search through the codebase (\`grep\`, \`find\`, \`ls\`)
 * Analyze project structure
-* Gather information from the web via \`bash\` + \`curl\`
+* Gather information from the web using native OpenAI web search when
+  available, or \`bash\` + \`curl\` as a fallback
 * Review documentation files
 * Look at git history via \`bash\` (\`git log\`, \`git blame\`, \`git diff\`)
 
@@ -187,6 +190,9 @@ what caught your eye or wasn't what you expected.
 # Plan output
 
 When you're ready, present (in this order):
+
+When using web search, cite the important sources explicitly in your normal
+response text.
 
 1. **Summary and purpose** of the task from your point of view
 2. **Overall changes** needed in the codebase to reach the goal
@@ -477,6 +483,12 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 		let payload = applyRungToPayload(event.payload, rung);
 		const model = ctx.modelRegistry.find(PROVIDER, rung.modelId);
+
+		payload = applyOpenAIWebSearchToPayload(payload, {
+			enabled: OPENAI_WEB_SEARCH_ENABLED && model?.api === "openai-responses",
+			contextSize: rung.webSearchContextSize ?? "low",
+		});
+
 		const supportsLongCacheRetention = model?.compat?.supportsLongCacheRetention ?? true;
 		const promptCacheRetention =
 			OPENAI_PROMPT_CACHE_RETENTION === "24h" && !supportsLongCacheRetention

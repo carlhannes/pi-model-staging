@@ -13,11 +13,11 @@ user → reset to the top.**
 
 ```ts
 const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] snappy / user-facing
-    { modelId: "gpt-5.5",       thinking: "xhigh" }, // [1] first autonomous step
-    { modelId: "gpt-5.5",       thinking: "high"  }, // [2]
-    { modelId: "gpt-5.4",       thinking: "high"  }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high"  }, // [4]+ (last rung repeats)
+    { modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high"   }, // [0] snappy / user-facing
+    { modelId: "gpt-5.5",       thinking: "xhigh", webSearchContextSize: "high"   }, // [1] first autonomous step
+    { modelId: "gpt-5.5",       thinking: "high",  webSearchContextSize: "medium" }, // [2]
+    { modelId: "gpt-5.4",       thinking: "high",  webSearchContextSize: "low"    }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high",  webSearchContextSize: "low"    }, // [4]+ (last rung repeats)
 ];
 ```
 
@@ -151,11 +151,11 @@ and edit the two things near the top:
 const PROVIDER = "openai-proxy";
 
 const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan + user-facing
-    { modelId: "gpt-5.5",       thinking: "xhigh" }, // [1] first autonomous step
-    { modelId: "gpt-5.5",       thinking: "high"  }, // [2]
-    { modelId: "gpt-5.4",       thinking: "high"  }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high"  }, // [4]+ (clamps here forever)
+    { modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high"   }, // [0] plan + user-facing
+    { modelId: "gpt-5.5",       thinking: "xhigh", webSearchContextSize: "high"   }, // [1] first autonomous step
+    { modelId: "gpt-5.5",       thinking: "high",  webSearchContextSize: "medium" }, // [2]
+    { modelId: "gpt-5.4",       thinking: "high",  webSearchContextSize: "low"    }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high",  webSearchContextSize: "low"    }, // [4]+ (clamps here forever)
 ];
 ```
 
@@ -170,6 +170,9 @@ const LADDER: Rung[] = [
 - `thinking` — `"minimal" | "low" | "medium" | "high" | "xhigh"`.
   Auto-clamped to model capabilities (e.g. setting `xhigh` on a model that
   only supports `high` will silently drop to `high`).
+- `webSearchContextSize` — optional. `"low" | "medium" | "high" | "off"`.
+  Controls OpenAI Responses native `web_search` tool context size for this rung.
+  Use `"off"` to disable hosted search on a specific rung.
 
 ### Model and provider names
 
@@ -205,7 +208,7 @@ then `[3]`, and so on.
 
 ### System-prompt nudges
 
-Edit `PLAN_PROMPT` and `EXEC_FIRST_PROMPT` in `index.ts` to change the
+Edit `PLAN_PROMPT` and `IMPL_FIRST_PROMPT` in `index.ts` to change the
 messages that get injected at the start of plan / implementation phases.
 
 ## Usage
@@ -233,7 +236,7 @@ Plan ready — what next?
 ```
 
 The status line at the bottom shows the live cursor:
-`▶ exec [2] openai-proxy/gpt-5.5:high (3/5)`.
+`▶ impl [2] openai-proxy/gpt-5.5:high (3/5)`.
 
 ### Commands
 
@@ -260,6 +263,28 @@ only one rung). After a bumped turn, the stage cursor continues at the rung *aft
 | Aborted turn                           | stage NOT advanced (so /resume picks up here) |
 | `agent_end` during implementing        | `stage=0` (reset for next user prompt)        |
 | `/plan` again, or `/stepdown-off`      | reset                                         |
+
+## Native web search (OpenAI Responses)
+
+When using an OpenAI Responses-compatible provider, this extension enables the
+hosted `web_search` tool by default.
+
+- It injects `{ "type": "web_search" }` into the wire payload's `tools`.
+- `search_context_size` follows the current ladder rung via
+  `rung.webSearchContextSize` ("high" → "medium" → "low" as the extension steps
+  down).
+- Search is optional: if `tool_choice` is missing, it's set to `"auto"` so the
+  model decides when to search.
+- Only OpenAI Responses payloads are modified; Chat Completions payloads are
+  left unchanged.
+- The legacy `web_search_preview` tool is not used.
+
+Disable globally by setting `PI_OPENAI_WEB_SEARCH=0`.
+Disable per rung by setting `webSearchContextSize: "off"` on that rung.
+
+Caveat: Pi's visible cost/footer and citation rendering may not expose every
+hosted web-search detail. The prompt asks the model to cite important web
+sources explicitly in normal text.
 
 ## Prompt caching (OpenAI)
 
@@ -302,7 +327,7 @@ Check OpenAI usage fields (`cached_tokens`), or in pi watch session stats:
 npm test
 ```
 
-Runs 41 unit tests via Node's built-in test runner with type stripping
+Runs unit tests via Node's built-in test runner with type stripping
 (no extra deps). Coverage:
 
 - API detection: OpenAI Responses / OpenAI Completions / Anthropic adaptive /
@@ -312,11 +337,14 @@ Runs 41 unit tests via Node's built-in test runner with type stripping
 - `chooseRung` mode/stage dispatch including clamping
 - `nextStage` advancement (called from both normal turn_end and post-bump
   paths)
+- OpenAI native web-search tool injection, including per-rung
+  `search_context_size`, opt-out, duplicate-tool avoidance, and Chat
+  Completions pass-through
 - OpenAI prompt-cache key/retention augmentation, including the
   user-opt-out path
 - Reasoning bump trigger detection (failed bash, package-manager output)
 - **End-to-end lifecycles** (two scenarios):
-  - Plain plan → accept → exec → reset → follow-up, asserting the exact
+  - Plain plan → accept → implement → reset → follow-up, asserting the exact
     sequence of model + effort values at every LLM call
   - Bumped path: a `npm test`-style trigger mid-run, asserting the
     bumped turn uses LADDER[1] and the next normal turn resumes at
@@ -364,9 +392,9 @@ the plan finishes.
   explicit budgets in your proxy if you need per-turn budget control.
 - The state we persist across `/resume` is `mode + stage`. One-shot bump
   state is intentionally in-memory only. The state machine resumes correctly
-  but the auto-injected `EXEC_FIRST_PROMPT` fires only once per accept, not
+  but the auto-injected `IMPL_FIRST_PROMPT` fires only once per accept, not
   on resume.
-- `setModel()` is called only at `/plan` (once per plan→exec cycle), so
+- `setModel()` is called only at `/plan` (once per plan→implementation cycle), so
   pi's own model display lags behind the actual rung in flight. Our
   status widget shows the truth — see Troubleshooting.
 
@@ -380,7 +408,7 @@ If you want to fork or learn from it:
   — pure functions for API detection and payload rewriting. Zero pi
   imports so it's testable in isolation.
 - [.pi/extensions/plan-stepdown/rewrite.test.ts](.pi/extensions/plan-stepdown/rewrite.test.ts)
-  — 41 unit tests with realistic payload fixtures, prompt-cache coverage
+  — unit tests with realistic payload fixtures, prompt-cache coverage
   (including user opt-out), reasoning-bump coverage, and two end-to-end
   lifecycle simulations (with and without a bump).
 

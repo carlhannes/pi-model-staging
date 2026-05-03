@@ -9,10 +9,14 @@
 import { createHash } from "node:crypto";
 
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+export type WebSearchContextSize = "low" | "medium" | "high";
+export type WebSearchContextSetting = WebSearchContextSize | "off";
 
 export type Rung = {
 	modelId: string;
 	thinking: ThinkingLevel;
+	/** Native OpenAI Responses web_search context size for this rung. "off" disables hosted search for the rung. */
+	webSearchContextSize?: WebSearchContextSetting;
 };
 
 export type PromptCacheRetention = "in_memory" | "24h";
@@ -22,6 +26,13 @@ export type PromptCacheOptions = {
 	key?: string;
 	/** Set to "24h" for extended retention, "in_memory" to request default memory retention, or undefined to omit. */
 	retention?: PromptCacheRetention;
+};
+
+export type OpenAIWebSearchOptions = {
+	/** Default-on feature gate. Set false for proxies/models that reject hosted web_search. */
+	enabled: boolean;
+	/** Per-rung Responses web_search context size. "off" disables hosted search for this payload. */
+	contextSize?: WebSearchContextSetting;
 };
 
 export type ReasoningBumpConfig = {
@@ -198,6 +209,45 @@ export function applyRungToPayload(payload: unknown, rung: Rung): unknown {
 			break;
 		case "unknown":
 			break;
+	}
+
+	return out;
+}
+
+function hasHostedWebSearchTool(tools: unknown[]): boolean {
+	return tools.some((tool) => {
+		if (!tool || typeof tool !== "object") return false;
+		const type = (tool as Record<string, unknown>).type;
+		// We only inject modern `web_search`, but avoid adding a second hosted
+		// search tool if another layer already supplied the legacy preview tool.
+		return type === "web_search" || type === "web_search_preview";
+	});
+}
+
+/**
+ * Add OpenAI Responses native hosted web search to a NEW payload object.
+ * Existing coding/function tools are preserved, and `web_search` is never
+ * duplicated. Non-Responses payloads pass through unchanged.
+ */
+export function applyOpenAIWebSearchToPayload(payload: unknown, options: OpenAIWebSearchOptions): unknown {
+	if (!options.enabled) return payload;
+	const contextSize = options.contextSize ?? "low";
+	if (contextSize === "off") return payload;
+	if (!payload || typeof payload !== "object") return payload;
+	if (detectApi(payload) !== "openai-responses") return payload;
+
+	const p = payload as Record<string, unknown>;
+	if (p.tools !== undefined && !Array.isArray(p.tools)) return payload;
+
+	const existingTools = Array.isArray(p.tools) ? p.tools : [];
+	const out: Record<string, unknown> = { ...p };
+
+	if (!hasHostedWebSearchTool(existingTools)) {
+		out.tools = [...existingTools, { type: "web_search", search_context_size: contextSize }];
+	}
+
+	if (out.tool_choice === undefined) {
+		out.tool_choice = "auto";
 	}
 
 	return out;
