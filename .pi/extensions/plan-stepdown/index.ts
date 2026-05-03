@@ -1,7 +1,7 @@
 /**
  * plan-stepdown
  *
- * Plan-then-execute mode for pi with a single configurable model ladder.
+ * Plan-then-implement mode for pi with a single configurable model ladder.
  *
  * One ladder. One counter. One mental model:
  *
@@ -9,12 +9,12 @@
  *               used while the user is in control:
  *               - every LLM call inside plan mode
  *               - the first turn of any user follow-up prompt during
- *                 executing (the LLM responding directly to the user)
+ *                 implementing (the LLM responding directly to the user)
  *
  *   LADDER[1]   "first autonomous step" (e.g. gpt-5.5 xhigh)
  *               used for the first LLM call after the plan is accepted
- *               (the auto-injected "Execute the plan." run), and then for
- *               turn 2 of each user follow-up.
+ *               (the auto-injected "Please start implementation." run),
+ *               and then for turn 2 of each user follow-up.
  *
  *   LADDER[2..] cheaper / weaker — used while the agent is working by
  *               itself inside one run (turn 3, 4, 5...). Last rung repeats
@@ -22,17 +22,18 @@
  *
  * Stepping only happens while the agent is "working by itself" inside
  * one run. As soon as the run ends and control returns to the user
- * (agent_end during executing), the stage resets so the next prompt
+ * (agent_end during implementing), the stage resets so the next prompt
  * starts at the snappy tier again.
  *
  * How the swap actually happens:
  *
- *   • setModel() runs exactly once per plan→exec cycle, at /plan. Because
- *     every rung shares PROVIDER, that single binding carries provider /
- *     baseUrl / auth through plan mode, the auto-injected "Execute the
- *     plan." run, and any user follow-ups in executing mode. We avoid
- *     calling setModel again because it persists the model as a default in
- *     pi settings, which would bounce around per turn.
+ *   • setModel() runs exactly once per plan→implementation cycle, at /plan.
+ *     Because every rung shares PROVIDER, that single binding carries
+ *     provider / baseUrl / auth through plan mode, the auto-injected
+ *     "Please start implementation." run, and any user follow-ups in
+ *     implementing mode. We avoid calling setModel again because it
+ *     persists the model as a default in pi settings, which would bounce
+ *     around per turn.
  *
  *   • before_provider_request rewrites the wire payload's `model` and
  *     `reasoning.effort` (or `reasoning_effort` etc, depending on API) on
@@ -52,7 +53,7 @@
  * Commands:
  *   /plan          — enter plan mode, lock to read-only tools
  *   /stepdown      — show the ladder with the cursor
- *   /stepdown-off  — leave plan/exec mode, restore full tools
+ *   /stepdown-off  — leave plan/implementation mode, restore full tools
  */
 
 import { userInfo } from "node:os";
@@ -91,8 +92,8 @@ const OPENAI_PROMPT_CACHE_KEY_PREFIX = "pi-model-staging:";
 const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
 
 // One-shot reasoning bump triggers.
-// When a trigger fires, the *next* LLM call in executing mode temporarily uses
-// LADDER[BUMP_RUNG_INDEX] (clamped if the ladder is shorter).
+// When a trigger fires, the *next* LLM call in implementing mode temporarily
+// uses LADDER[BUMP_RUNG_INDEX] (clamped if the ladder is shorter).
 const REASONING_BUMP: ReasoningBumpConfig = {
 	bumpOnFailedBash: true,
 	bumpOnPackageManagerCommand: true,
@@ -113,7 +114,7 @@ const LADDER: Rung[] = [
 
 // Tools available during planning — read-only.
 const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls"];
-const EXEC_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const IMPL_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 const PLAN_PROMPT = `[PLAN MODE]
 
@@ -194,7 +195,7 @@ When you're ready, present (in this order):
 4. **Confidence level** — your honest read on how certain the plan is
    right
 5. **Step-by-step plan** under a heading "Plan:" — one numbered line per
-   step (this is what the executing phase will work from)
+   step (this is what the implementation phase will work from)
 
 Keep the plan to a high architectural standard — DRY, KISS, separation
 of concerns.
@@ -203,8 +204,9 @@ of concerns.
 
 The user will see a dialog with three choices:
 
-* **Execute the plan** — the extension auto-sends "Execute the plan."
-  and you switch to implementation mode (with edit/write restored)
+* **Start implementation** — the extension auto-sends "Please start
+  implementation." and you switch to implementation mode (with edit/write
+  restored)
 * **Refine — stay in plan mode** — you stay here; the user will give
   more feedback
 * **Cancel — leave plan mode** — drops back to normal pi
@@ -213,7 +215,7 @@ When revising the plan based on feedback, restate the WHOLE plan so the
 user can track the diff between revisions and the conclusions reached
 during planning.`;
 
-const EXEC_FIRST_PROMPT = `[EXECUTING PLAN]
+const IMPL_FIRST_PROMPT = `[IMPLEMENTATION MODE]
 
 The user has approved the plan you produced. Edit and write tools are
 available again. Implement the plan you laid out, applying the same
@@ -254,7 +256,7 @@ Then summarize what changed and report back.`;
 export default function planStepdownExtension(pi: ExtensionAPI): void {
 	let mode: Mode = "idle";
 	// Single global counter. 0 during planning, set to 1 on accept,
-	// incremented at every turn_end during executing (clamped to ladder end).
+	// incremented at every turn_end during implementing (clamped to ladder end).
 	let stage = 0;
 
 	// One-shot bump state.
@@ -304,10 +306,10 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const idx = effectiveRungIndexForStatus();
 		const rung = LADDER[idx];
 		const color = mode === "planning" ? "warning" : "accent";
-		const icon = mode === "planning" ? "📋 plan" : "▶ exec";
+		const icon = mode === "planning" ? "📋 plan" : "▶ impl";
 
 		let suffix = "";
-		if (mode === "executing") {
+		if (mode === "implementing") {
 			if (activeBump) {
 				suffix = ` ↑ ${activeBump.reason}`;
 			} else if (pendingBump) {
@@ -355,7 +357,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		stage = 0;
 		pendingBump = null;
 		activeBump = null;
-		pi.setActiveTools(EXEC_TOOLS);
+		pi.setActiveTools(IMPL_TOOLS);
 		updateStatus(ctx);
 		persist();
 	}
@@ -424,10 +426,11 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 				message: { customType: "plan-stepdown-context", content: PLAN_PROMPT, display: false },
 			};
 		}
-		if (mode === "executing" && stage === 1) {
-			// Only inject "executing" prompt at the very first executing turn.
+		if (mode === "implementing" && stage === 1) {
+			// Only inject the implementation-mode prompt at the very first
+			// implementing turn.
 			return {
-				message: { customType: "plan-stepdown-context", content: EXEC_FIRST_PROMPT, display: false },
+				message: { customType: "plan-stepdown-context", content: IMPL_FIRST_PROMPT, display: false },
 			};
 		}
 	});
@@ -436,7 +439,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// turn_start: if a bump is queued, arm it for this turn.
 	// -------------------------------------------------------------------------
 	pi.on("turn_start", async (_event, ctx) => {
-		if (mode !== "executing") return;
+		if (mode !== "implementing") return;
 		if (!pendingBump) return;
 		activeBump = pendingBump;
 		pendingBump = null;
@@ -448,7 +451,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// the *next* LLM call.
 	// -------------------------------------------------------------------------
 	pi.on("tool_result", async (event, ctx) => {
-		if (mode !== "executing") return;
+		if (mode !== "implementing") return;
 
 		const reason = detectReasoningBump(
 			{ toolName: event.toolName, input: event.input, isError: event.isError },
@@ -488,11 +491,11 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	});
 
 	// -------------------------------------------------------------------------
-	// turn_end: advance the stage counter during executing. Don't advance on
-	// aborted turns so /resume continues at the same rung.
+	// turn_end: advance the stage counter during implementing. Don't advance
+	// on aborted turns so /resume continues at the same rung.
 	// -------------------------------------------------------------------------
 	pi.on("turn_end", async (event, ctx) => {
-		if (mode !== "executing") return;
+		if (mode !== "implementing") return;
 		const stop = (event.message as { stopReason?: string } | undefined)?.stopReason;
 		if (stop === "aborted") return;
 
@@ -510,17 +513,18 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// -------------------------------------------------------------------------
 	// agent_end: two distinct cases.
 	//
-	//   planning  → show the accept dialog. On accept, jump stage to 1 so
-	//               the auto-injected "Execute the plan." run starts at
-	//               LADDER[1] (carrying the plan forward into autonomous
-	//               work). On cancel, reset.
+	//   planning      → show the accept dialog. On accept, jump stage to 1
+	//                   so the auto-injected "Please start implementation."
+	//                   run starts at LADDER[1] (carrying the plan forward
+	//                   into autonomous work). On cancel, reset.
 	//
-	//   executing → control is going back to the user. Reset stage to 0 so
-	//               their next prompt starts at the snappy/user-facing
-	//               tier again. Stepping only happens inside one run.
+	//   implementing  → control is going back to the user. Reset stage to 0
+	//                   so their next prompt starts at the snappy/user-
+	//                   facing tier again. Stepping only happens inside one
+	//                   run.
 	// -------------------------------------------------------------------------
 	pi.on("agent_end", async (_event, ctx) => {
-		if (mode === "executing") {
+		if (mode === "implementing") {
 			stage = 0;
 			pendingBump = null;
 			activeBump = null;
@@ -533,21 +537,21 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) return;
 
 		const choice = await ctx.ui.select("Plan ready — what next?", [
-			"Execute the plan",
+			"Start implementation",
 			"Refine — stay in plan mode",
 			"Cancel — leave plan mode",
 		]);
 
-		if (choice === "Execute the plan") {
-			mode = "executing";
+		if (choice === "Start implementation") {
+			mode = "implementing";
 			stage = 1;
 			pendingBump = null;
 			activeBump = null;
-			pi.setActiveTools(EXEC_TOOLS);
+			pi.setActiveTools(IMPL_TOOLS);
 			updateStatus(ctx);
 			persist();
 			pi.sendMessage(
-				{ customType: "plan-stepdown-execute", content: "Execute the plan.", display: true },
+				{ customType: "plan-stepdown-implement", content: "Please start implementation.", display: true },
 				{ triggerTurn: true },
 			);
 		} else if (choice === "Cancel — leave plan mode") {

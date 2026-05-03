@@ -39,7 +39,7 @@ export type ToolResultForBump = {
 	isError: boolean;
 };
 
-export type Mode = "idle" | "planning" | "executing";
+export type Mode = "idle" | "planning" | "implementing";
 
 /**
  * Build a stable OpenAI prompt-cache affinity key for this local project.
@@ -99,15 +99,15 @@ export type ApiKind =
 	| "unknown";
 
 /**
- * Which rung applies given mode + the executing-stage counter.
+ * Which rung applies given mode + the implementation-stage counter.
  *
- *   idle       → null (extension does nothing)
- *   planning   → ladder[0] (always, for every LLM call during planning)
- *   executing  → ladder[stage], clamped to last rung so going past the
- *                end repeats the strongest tier-down forever
+ *   idle           → null (extension does nothing)
+ *   planning       → ladder[0] (always, for every LLM call during planning)
+ *   implementing   → ladder[stage], clamped to last rung so going past the
+ *                    end repeats the strongest tier-down forever
  *
  * `stage` is a single global counter. It's set to 1 when the user accepts
- * the plan, then incremented at the end of every executing turn. So:
+ * the plan, then incremented at the end of every implementing turn. So:
  *   stage=1 → ladder[1]  (first LLM call after plan accepted)
  *   stage=2 → ladder[2]  (second LLM call)
  *   ...and so on
