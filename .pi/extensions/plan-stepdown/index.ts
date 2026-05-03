@@ -136,8 +136,11 @@ const LADDER: Rung[] = [
 	{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" }, // [0] plan mode (every LLM call)
 	{ modelId: "gpt-5.5", thinking: "xhigh", webSearchContextSize: "high" }, // [1] first call after plan accepted
 	{ modelId: "gpt-5.5", thinking: "high", webSearchContextSize: "medium" }, // [2]
-	{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "low" }, // [3]
-	{ modelId: "gpt-5.2", thinking: "high", webSearchContextSize: "low" }, // [4]+ (clamps here forever)
+	{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "medium" }, // [3]
+	{ modelId: "gpt-5.4", thinking: "medium", webSearchContextSize: "medium" }, // [4]
+	{ modelId: "gpt-5.4", thinking: "medium", webSearchContextSize: "low" }, // [5]
+	{ modelId: "gpt-5.2", thinking: "high", webSearchContextSize: "low" }, // [6]
+	{ modelId: "gpt-5.2", thinking: "medium", webSearchContextSize: "low" }, // [7]+ (clamps here forever)
 ];
 
 // Tools available during planning — read-only.
