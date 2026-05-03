@@ -29,11 +29,14 @@ const LADDER: Rung[] = [
 | `agent_end` during executing → user gets control back                | reset to 0  |
 | User follow-up prompt, turn 1 (LLM responding to user, "user-facing")| `LADDER[0]` |
 | Same prompt, turn 2, 3, ... (autonomous tool calls)                  | step down   |
+| Failing bash / npm/pnpm/yarn/bun result during executing             | bump next call to `LADDER[1]`, then continue at `LADDER[2]` |
 | Re-entering `/plan`                                                  | `LADDER[0]` |
 
 So `[0]` covers "user is in control or shaping the plan", `[1]` is "first
 step into autonomous work", and `[2..]` are progressive degradation as the
-agent keeps grinding without checking back in.
+agent keeps grinding without checking back in. Important tool results can
+restart that autonomous cursor from `[1]` so error/test interpretation gets
+stronger reasoning before stepping down again.
 
 ## How it actually works
 
@@ -184,6 +187,19 @@ Edit `PLAN_TOOLS` / `EXEC_TOOLS` in `index.ts` if the defaults don't match
 your tool set. Default plan-mode tools are read-only: `read`, `bash`,
 `grep`, `find`, `ls`. Default execute tools add `edit` and `write`.
 
+### Reasoning bump triggers
+
+Edit `REASONING_BUMP` in `index.ts` to change which tool results restart the
+autonomous cursor from `LADDER[1]` (or `LADDER[0]` for a one-rung ladder).
+Defaults:
+
+- failed bash commands (`isError: true`, including non-zero exit codes and timeouts)
+- bash commands that start with `npm`, `pnpm`, `yarn`, or `bun`
+
+After the bumped turn completes, normal stepping resumes at the rung after the
+bump. With the default ladder that means `[1]` for the bumped turn, then `[2]`,
+then `[3]`, and so on.
+
 ### System-prompt nudges
 
 Edit `PLAN_PROMPT` and `EXEC_FIRST_PROMPT` in `index.ts` to change the
@@ -278,7 +294,7 @@ Check OpenAI usage fields (`cached_tokens`), or in pi watch session stats:
 npm test
 ```
 
-Runs 23 unit tests via Node's built-in test runner with type stripping
+Runs 42 unit tests via Node's built-in test runner with type stripping
 (no extra deps). Coverage:
 
 - API detection: OpenAI Responses / OpenAI Completions / Anthropic adaptive /
@@ -286,6 +302,8 @@ Runs 23 unit tests via Node's built-in test runner with type stripping
 - Payload rewriting per API: model + reasoning swap, no input mutation,
   graceful degradation on unknown payloads
 - `chooseRung` mode/stage dispatch including clamping
+- OpenAI prompt-cache key/retention augmentation
+- Reasoning bump trigger detection and post-bump stage advancement
 - **End-to-end lifecycle**: simulates a full plan run → accept → exec run
   with stepping → agent_end reset → user follow-up → second reset, and
   asserts the exact sequence of model + effort values that hits the wire
@@ -331,9 +349,10 @@ the plan finishes.
 - Anthropic budget thinking and Google models swap `model` only; the
   thinking budget is left alone. Use adaptive Anthropic models or set
   explicit budgets in your proxy if you need per-turn budget control.
-- The state we persist across `/resume` is `mode + stage`. The state
-  machine resumes correctly but the auto-injected `EXEC_FIRST_PROMPT`
-  fires only once per accept, not on resume.
+- The state we persist across `/resume` is `mode + stage`. One-shot bump
+  state is intentionally in-memory only. The state machine resumes correctly
+  but the auto-injected `EXEC_FIRST_PROMPT` fires only once per accept, not
+  on resume.
 - `setModel()` is called only at `/plan`, so re-entering `/plan` after a
   long executing session will re-bind the provider but pi's display may
   still lag for a moment until the next turn.
@@ -348,8 +367,8 @@ If you want to fork or learn from it:
   — pure functions for API detection and payload rewriting. Zero pi
   imports so it's testable in isolation.
 - [.pi/extensions/plan-stepdown/rewrite.test.ts](.pi/extensions/plan-stepdown/rewrite.test.ts)
-  — 23 unit tests with realistic payload fixtures and full lifecycle
-  simulation.
+  — 42 unit tests with realistic payload fixtures, prompt-cache coverage,
+  reasoning-bump coverage, and full lifecycle simulation.
 
 The pi APIs used are documented at:
 - [pi extensions guide](https://pi.dev/docs/latest/extensions)
