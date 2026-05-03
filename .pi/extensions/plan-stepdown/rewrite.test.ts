@@ -497,52 +497,60 @@ test("startsWithShellCommand: matches only at start (after whitespace)", () => {
 	assert.equal(startsWithShellCommand("cd x && npm test", "npm"), false);
 });
 
+const BUMP_CFG: ReasoningBumpConfig = {
+	bumpOnFailedBash: true,
+	bumpOnFailedTool: true,
+	bumpOnPackageManagerCommand: true,
+	packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+};
+
 test("detectReasoningBump: bumps on failed bash", () => {
-	const cfg: ReasoningBumpConfig = {
-		bumpOnFailedBash: true,
-		bumpOnPackageManagerCommand: true,
-		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
-	};
 	assert.equal(
-		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: true }, cfg),
+		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: true }, BUMP_CFG),
 		"failed bash command",
 	);
 });
 
 test("detectReasoningBump: bumps on npm output even when successful", () => {
-	const cfg: ReasoningBumpConfig = {
-		bumpOnFailedBash: true,
-		bumpOnPackageManagerCommand: true,
-		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
-	};
 	assert.equal(
-		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: false }, cfg),
+		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: false }, BUMP_CFG),
 		"npm command result",
 	);
 });
 
 test("detectReasoningBump: bumps on other package managers", () => {
-	const cfg: ReasoningBumpConfig = {
-		bumpOnFailedBash: true,
-		bumpOnPackageManagerCommand: true,
-		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
-	};
 	assert.equal(
-		detectReasoningBump({ toolName: "bash", input: { command: "pnpm test" }, isError: false }, cfg),
+		detectReasoningBump({ toolName: "bash", input: { command: "pnpm test" }, isError: false }, BUMP_CFG),
 		"pnpm command result",
 	);
 });
 
 test("detectReasoningBump: no bump for non-matching bash", () => {
-	const cfg: ReasoningBumpConfig = {
-		bumpOnFailedBash: true,
-		bumpOnPackageManagerCommand: true,
-		packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
-	};
 	assert.equal(
-		detectReasoningBump({ toolName: "bash", input: { command: "git status" }, isError: false }, cfg),
+		detectReasoningBump({ toolName: "bash", input: { command: "git status" }, isError: false }, BUMP_CFG),
 		null,
 	);
+});
+
+test("detectReasoningBump: bumps on failed edit tool", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "edit", input: { path: "a.txt" }, isError: true }, BUMP_CFG),
+		"failed edit tool",
+	);
+});
+
+test("detectReasoningBump: no bump for successful edit tool", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "edit", input: { path: "a.txt" }, isError: false }, BUMP_CFG),
+		null,
+	);
+});
+
+test("detectReasoningBump: can disable non-bash failed-tool bump", () => {
+	const cfg: ReasoningBumpConfig = { ...BUMP_CFG, bumpOnFailedTool: false };
+	assert.equal(detectReasoningBump({ toolName: "edit", input: { path: "a.txt" }, isError: true }, cfg), null);
+	// Still bumps bash failures.
+	assert.equal(detectReasoningBump({ toolName: "bash", input: { command: "false" }, isError: true }, cfg), "failed bash command");
 });
 
 const STAGE_LADDER: Rung[] = [

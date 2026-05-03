@@ -29,7 +29,7 @@ const LADDER: Rung[] = [
 | `agent_end` during implementing → user gets control back             | reset to 0  |
 | User follow-up prompt, turn 1 (LLM responding to user, "user-facing")| `LADDER[0]` |
 | Same prompt, turn 2, 3, ... (autonomous tool calls)                  | step down   |
-| Failing bash / npm/pnpm/yarn/bun result during implementing          | bump next call to `LADDER[1]`, then continue at `LADDER[2]` |
+| Failed tool / bash / npm/pnpm/yarn/bun result during implementing   | bump next call to `LADDER[1]`, then continue at `LADDER[2]` |
 | Re-entering `/plan`                                                  | `LADDER[0]` |
 
 So `[0]` covers "user is in control or shaping the plan", `[1]` is "first
@@ -200,6 +200,7 @@ autonomous cursor from `LADDER[1]` (or `LADDER[0]` for a one-rung ladder).
 Defaults:
 
 - failed bash commands (`isError: true`, including non-zero exit codes and timeouts)
+- failed non-bash tools (`isError: true`, e.g. `edit` exact-match failures)
 - bash commands that start with `npm`, `pnpm`, `yarn`, or `bun`
 
 After the bumped turn completes, normal stepping resumes at the rung after the
@@ -249,8 +250,8 @@ The status line at the bottom shows the live cursor:
 ### State machine summary
 
 In addition to the stage counter, the extension also supports **one-shot reasoning bumps**
-inside implementing mode: when certain tool results arrive (e.g. failing bash, npm/pnpm/yarn/bun
-output), the *next* LLM call temporarily uses `LADDER[1]` (or `LADDER[0]` if the ladder has
+inside implementing mode: when certain tool results arrive (e.g. failed tools, failing bash,
+or npm/pnpm/yarn/bun output), the *next* LLM call temporarily uses `LADDER[1]` (or `LADDER[0]` if the ladder has
 only one rung). After a bumped turn, the stage cursor continues at the rung *after* the bump (so a bump on `LADDER[1]` continues at `LADDER[2]`).
 
 | Event                                  | Stage transition                              |
@@ -342,7 +343,7 @@ Runs unit tests via Node's built-in test runner with type stripping
   Completions pass-through
 - OpenAI prompt-cache key/retention augmentation, including the
   user-opt-out path
-- Reasoning bump trigger detection (failed bash, package-manager output)
+- Reasoning bump trigger detection (failed bash, failed tool calls, package-manager output)
 - **End-to-end lifecycles** (two scenarios):
   - Plain plan → accept → implement → reset → follow-up, asserting the exact
     sequence of model + effort values at every LLM call

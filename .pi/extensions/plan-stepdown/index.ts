@@ -98,6 +98,7 @@ const OPENAI_WEB_SEARCH_ENABLED = process.env.PI_OPENAI_WEB_SEARCH !== "0";
 // uses LADDER[BUMP_RUNG_INDEX] (clamped if the ladder is shorter).
 const REASONING_BUMP: ReasoningBumpConfig = {
 	bumpOnFailedBash: true,
+	bumpOnFailedTool: true,
 	bumpOnPackageManagerCommand: true,
 	packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
 };

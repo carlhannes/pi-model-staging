@@ -38,6 +38,8 @@ export type OpenAIWebSearchOptions = {
 export type ReasoningBumpConfig = {
 	/** Bump reasoning for the next LLM call when a bash command fails (non-zero exit, timeout, etc.). */
 	bumpOnFailedBash: boolean;
+	/** Bump reasoning for the next LLM call when a non-bash tool fails (edit exact-match errors, read failures, etc.). */
+	bumpOnFailedTool: boolean;
 	/** Bump reasoning for the next LLM call when a package-manager command output must be interpreted. */
 	bumpOnPackageManagerCommand: boolean;
 	/** Which executables count as package managers (matched at the start of the bash command). */
@@ -97,6 +99,10 @@ export function detectReasoningBump(event: ToolResultForBump, config: ReasoningB
 		}
 
 		return null;
+	}
+
+	if (config.bumpOnFailedTool && event.isError) {
+		return `failed ${event.toolName} tool`;
 	}
 
 	return null;
