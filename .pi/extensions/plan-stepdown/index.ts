@@ -67,6 +67,7 @@ import {
 	detectReasoningBump,
 	nextStage,
 	type Mode,
+	type OpenAIWebSearchUserLocation,
 	type PromptCacheRetention,
 	type ReasoningBumpConfig,
 	type Rung,
@@ -92,6 +93,30 @@ const PROVIDER = "openai-proxy";
 const OPENAI_PROMPT_CACHE_KEY_PREFIX = "pi-model-staging:";
 const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
 const OPENAI_WEB_SEARCH_ENABLED = process.env.PI_OPENAI_WEB_SEARCH !== "0";
+const OPENAI_WEB_SEARCH_LOCATION_ENABLED = process.env.PI_OPENAI_WEB_SEARCH_LOCATION !== "0";
+
+const TIMEZONE_COUNTRY: Record<string, string> = {
+	"Europe/Stockholm": "SE",
+	"Europe/London": "GB",
+	"Europe/Berlin": "DE",
+	"Europe/Paris": "FR",
+	"Europe/Amsterdam": "NL",
+	"Europe/Copenhagen": "DK",
+	"Europe/Oslo": "NO",
+	"Europe/Helsinki": "FI",
+	"Europe/Madrid": "ES",
+	"Europe/Rome": "IT",
+	"America/New_York": "US",
+	"America/Chicago": "US",
+	"America/Denver": "US",
+	"America/Los_Angeles": "US",
+	"America/Toronto": "CA",
+	"America/Vancouver": "CA",
+	"Asia/Tokyo": "JP",
+	"Asia/Seoul": "KR",
+	"Asia/Singapore": "SG",
+	"Australia/Sydney": "AU",
+};
 
 // One-shot reasoning bump triggers.
 // When a trigger fires, the *next* LLM call in implementing mode temporarily
@@ -305,6 +330,39 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		return createPromptCacheKey(OPENAI_PROMPT_CACHE_KEY_PREFIX, getLocalUsername(), ctx.cwd);
 	}
 
+	function normalizeCountry(country: string | undefined): string | undefined {
+		if (!country) return undefined;
+		const normalized = country.trim().toUpperCase();
+		return /^[A-Z]{2}$/.test(normalized) ? normalized : undefined;
+	}
+
+	function normalizeTimezone(timezone: string | undefined): string | undefined {
+		const normalized = timezone?.trim();
+		return normalized && normalized.length > 0 ? normalized : undefined;
+	}
+
+	function detectSystemTimezone(): string | undefined {
+		try {
+			return normalizeTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+		} catch {
+			return undefined;
+		}
+	}
+
+	function countryFromTimezone(timezone: string | undefined): string | undefined {
+		if (!timezone) return undefined;
+		return TIMEZONE_COUNTRY[timezone];
+	}
+
+	function getOpenAIWebSearchUserLocation(): OpenAIWebSearchUserLocation | undefined {
+		if (!OPENAI_WEB_SEARCH_LOCATION_ENABLED) return undefined;
+		const timezone = normalizeTimezone(process.env.PI_OPENAI_WEB_SEARCH_TIMEZONE) ?? detectSystemTimezone();
+		const country =
+			normalizeCountry(process.env.PI_OPENAI_WEB_SEARCH_COUNTRY) ?? countryFromTimezone(timezone);
+		if (!timezone && !country) return undefined;
+		return { type: "approximate", ...(country ? { country } : {}), ...(timezone ? { timezone } : {}) };
+	}
+
 	function updateStatus(ctx: ExtensionContext): void {
 		if (mode === "idle") {
 			ctx.ui.setStatus("plan-stepdown", undefined);
@@ -485,9 +543,11 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		let payload = applyRungToPayload(event.payload, rung);
 		const model = ctx.modelRegistry.find(PROVIDER, rung.modelId);
 
+		const webSearchEnabled = OPENAI_WEB_SEARCH_ENABLED && model?.api === "openai-responses";
 		payload = applyOpenAIWebSearchToPayload(payload, {
-			enabled: OPENAI_WEB_SEARCH_ENABLED && model?.api === "openai-responses",
+			enabled: webSearchEnabled,
 			contextSize: rung.webSearchContextSize ?? "low",
+			userLocation: webSearchEnabled ? getOpenAIWebSearchUserLocation() : undefined,
 		});
 
 		const supportsLongCacheRetention = model?.compat?.supportsLongCacheRetention ?? true;

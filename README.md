@@ -280,7 +280,16 @@ hosted `web_search` tool by default.
   left unchanged.
 - The legacy `web_search_preview` tool is not used.
 
-Disable globally by setting `PI_OPENAI_WEB_SEARCH=0`.
+Location bias is enabled by default and sends approximate `country` and `timezone`
+(no city/region). Timezone comes from Node's local `Intl` settings unless
+overridden; country is inferred from common timezones such as
+`Europe/Stockholm` → `SE`, or omitted when unknown.
+
+- Disable location metadata with `PI_OPENAI_WEB_SEARCH_LOCATION=0`.
+- Override country with `PI_OPENAI_WEB_SEARCH_COUNTRY=SE`.
+- Override timezone with `PI_OPENAI_WEB_SEARCH_TIMEZONE=Europe/Stockholm`.
+
+Disable web search globally by setting `PI_OPENAI_WEB_SEARCH=0`.
 Disable per rung by setting `webSearchContextSize: "off"` on that rung.
 
 Caveat: Pi's visible cost/footer and citation rendering may not expose every

@@ -281,10 +281,11 @@ test("web search: openai-responses appends web_search tool and sets tool_choice 
 		stream: true,
 		tools: [{ type: "function", name: "read", parameters: {} }],
 	};
-	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "medium" }) as Record<
-		string,
-		unknown
-	>;
+	const out = applyOpenAIWebSearchToPayload(original, {
+		enabled: true,
+		contextSize: "medium",
+		userLocation: { type: "approximate", country: "SE", timezone: "Europe/Stockholm" },
+	}) as Record<string, unknown>;
 	assert.equal(out.model, "gpt-5.5");
 	assert.equal(out.tool_choice, "auto");
 	assert.ok(Array.isArray(out.tools));
@@ -293,6 +294,7 @@ test("web search: openai-responses appends web_search tool and sets tool_choice 
 	assert.equal(tools[0]?.type, "function");
 	assert.equal(tools[1]?.type, "web_search");
 	assert.equal(tools[1]?.search_context_size, "medium");
+	assert.deepEqual(tools[1]?.user_location, { type: "approximate", country: "SE", timezone: "Europe/Stockholm" });
 });
 
 test("web search: preserves existing tool_choice", () => {
@@ -363,6 +365,34 @@ test("web search: contextSize off disables injection", () => {
 	};
 	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "off" });
 	assert.deepEqual(out, original);
+});
+
+test("web search: omits user_location when not provided", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "low" }) as Record<string, unknown>;
+	const tools = (out.tools as Array<Record<string, unknown>> | undefined) ?? [];
+	const ws = tools.find((t) => t?.type === "web_search");
+	assert.ok(ws);
+	assert.equal(ws?.user_location, undefined);
+});
+
+test("web search: omits user_location when provided but empty", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, {
+		enabled: true,
+		contextSize: "low",
+		userLocation: { type: "approximate" },
+	}) as Record<string, unknown>;
+	const tools = (out.tools as Array<Record<string, unknown>> | undefined) ?? [];
+	const ws = tools.find((t) => t?.type === "web_search");
+	assert.ok(ws);
+	assert.equal(ws?.user_location, undefined);
 });
 
 test("web search: does not mutate input", () => {

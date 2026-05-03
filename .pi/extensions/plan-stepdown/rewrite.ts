@@ -28,11 +28,21 @@ export type PromptCacheOptions = {
 	retention?: PromptCacheRetention;
 };
 
+export type OpenAIWebSearchUserLocation = {
+	type: "approximate";
+	/** Two-letter ISO country code, e.g. "SE". */
+	country?: string;
+	/** IANA timezone, e.g. "Europe/Stockholm". */
+	timezone?: string;
+};
+
 export type OpenAIWebSearchOptions = {
 	/** Default-on feature gate. Set false for proxies/models that reject hosted web_search. */
 	enabled: boolean;
 	/** Per-rung Responses web_search context size. "off" disables hosted search for this payload. */
 	contextSize?: WebSearchContextSetting;
+	/** Optional approximate location for OpenAI Responses web_search. City/region intentionally omitted. */
+	userLocation?: OpenAIWebSearchUserLocation;
 };
 
 export type ReasoningBumpConfig = {
@@ -249,7 +259,11 @@ export function applyOpenAIWebSearchToPayload(payload: unknown, options: OpenAIW
 	const out: Record<string, unknown> = { ...p };
 
 	if (!hasHostedWebSearchTool(existingTools)) {
-		out.tools = [...existingTools, { type: "web_search", search_context_size: contextSize }];
+		const webSearchTool: Record<string, unknown> = { type: "web_search", search_context_size: contextSize };
+		if (options.userLocation?.country || options.userLocation?.timezone) {
+			webSearchTool.user_location = options.userLocation;
+		}
+		out.tools = [...existingTools, webSearchTool];
 	}
 
 	if (out.tool_choice === undefined) {
