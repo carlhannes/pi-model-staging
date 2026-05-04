@@ -1,7 +1,7 @@
 /**
  * plan-stepdown
  *
- * Plan-then-execute mode for pi with a single configurable model ladder.
+ * Plan-then-implement mode for pi with a single configurable model ladder.
  *
  * One ladder. One counter. One mental model:
  *
@@ -9,12 +9,12 @@
  *               used while the user is in control:
  *               - every LLM call inside plan mode
  *               - the first turn of any user follow-up prompt during
- *                 executing (the LLM responding directly to the user)
+ *                 implementing (the LLM responding directly to the user)
  *
  *   LADDER[1]   "first autonomous step" (e.g. gpt-5.5 xhigh)
  *               used for the first LLM call after the plan is accepted
- *               (the auto-injected "Execute the plan." run), and then for
- *               turn 2 of each user follow-up.
+ *               (the auto-injected "Please start implementation." run),
+ *               and then for turn 2 of each user follow-up.
  *
  *   LADDER[2..] cheaper / weaker — used while the agent is working by
  *               itself inside one run (turn 3, 4, 5...). Last rung repeats
@@ -22,14 +22,18 @@
  *
  * Stepping only happens while the agent is "working by itself" inside
  * one run. As soon as the run ends and control returns to the user
- * (agent_end during executing), the stage resets so the next prompt
+ * (agent_end during implementing), the stage resets so the next prompt
  * starts at the snappy tier again.
  *
  * How the swap actually happens:
  *
- *   • setModel() runs exactly twice per plan→exec cycle: once at /plan,
- *     once when you accept the plan. This binds the provider/baseUrl/auth
- *     for the agent run that follows.
+ *   • setModel() runs exactly once per plan→implementation cycle, at /plan.
+ *     Because every rung shares PROVIDER, that single binding carries
+ *     provider / baseUrl / auth through plan mode, the auto-injected
+ *     "Please start implementation." run, and any user follow-ups in
+ *     implementing mode. We avoid calling setModel again because it
+ *     persists the model as a default in pi settings, which would bounce
+ *     around per turn.
  *
  *   • before_provider_request rewrites the wire payload's `model` and
  *     `reasoning.effort` (or `reasoning_effort` etc, depending on API) on
@@ -49,11 +53,25 @@
  * Commands:
  *   /plan          — enter plan mode, lock to read-only tools
  *   /stepdown      — show the ladder with the cursor
- *   /stepdown-off  — leave plan/exec mode, restore full tools
+ *   /stepdown-off  — leave plan/implementation mode, restore full tools
  */
 
+import { userInfo } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { applyRungToPayload, chooseRung, type Mode, type Rung } from "./rewrite.js";
+import {
+	applyOpenAIWebSearchToPayload,
+	applyPromptCacheToPayload,
+	applyRungToPayload,
+	chooseRung,
+	createPromptCacheKey,
+	detectReasoningBump,
+	nextStage,
+	type Mode,
+	type OpenAIWebSearchUserLocation,
+	type PromptCacheRetention,
+	type ReasoningBumpConfig,
+	type Rung,
+} from "./rewrite.js";
 
 // ---------------------------------------------------------------------------
 // Configure here. Edit freely.
@@ -65,17 +83,69 @@ import { applyRungToPayload, chooseRung, type Mode, type Rung } from "./rewrite.
 
 const PROVIDER = "openai-proxy";
 
+// Conservative OpenAI prompt-cache augmentation.
+// - key: stable hash of local username + cwd, with a project-specific prefix
+//   outside the hash so raw local details are not sent to the provider.
+// - retention: use "24h" for GPT-5.x / gpt-4.1 direct OpenAI-compatible backends,
+//   or set to undefined if your proxy rejects the field.
+// We intentionally OMIT explicit in-memory retention to stay compatible with
+// both older and newer OpenAI SDK/type spellings.
+const OPENAI_PROMPT_CACHE_KEY_PREFIX = "pi-model-staging:";
+const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
+const OPENAI_WEB_SEARCH_ENABLED = process.env.PI_OPENAI_WEB_SEARCH !== "0";
+const OPENAI_WEB_SEARCH_LOCATION_ENABLED = process.env.PI_OPENAI_WEB_SEARCH_LOCATION !== "0";
+
+const TIMEZONE_COUNTRY: Record<string, string> = {
+	"Europe/Stockholm": "SE",
+	"Europe/London": "GB",
+	"Europe/Berlin": "DE",
+	"Europe/Paris": "FR",
+	"Europe/Amsterdam": "NL",
+	"Europe/Copenhagen": "DK",
+	"Europe/Oslo": "NO",
+	"Europe/Helsinki": "FI",
+	"Europe/Madrid": "ES",
+	"Europe/Rome": "IT",
+	"America/New_York": "US",
+	"America/Chicago": "US",
+	"America/Denver": "US",
+	"America/Los_Angeles": "US",
+	"America/Toronto": "CA",
+	"America/Vancouver": "CA",
+	"Asia/Tokyo": "JP",
+	"Asia/Seoul": "KR",
+	"Asia/Singapore": "SG",
+	"Australia/Sydney": "AU",
+};
+
+// One-shot reasoning bump triggers.
+// When a trigger fires, the *next* LLM call in implementing mode temporarily
+// uses LADDER[BUMP_RUNG_INDEX] (clamped if the ladder is shorter).
+const REASONING_BUMP: ReasoningBumpConfig = {
+	bumpOnFailedBash: true,
+	bumpOnFailedTool: true,
+	bumpOnPackageManagerCommand: true,
+	packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+};
+
+// The rung to bump to. Always ladder[1] (the "first autonomous step" tier),
+// or clamped to the last rung if the ladder is shorter.
+const BUMP_RUNG_INDEX = 1;
+
 const LADDER: Rung[] = [
-	{ modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan mode (every LLM call)
-	{ modelId: "gpt-5.5", thinking: "xhigh" }, // [1] first call after plan accepted
-	{ modelId: "gpt-5.5", thinking: "high" }, // [2]
-	{ modelId: "gpt-5.4", thinking: "high" }, // [3]
-	{ modelId: "gpt-5.2", thinking: "high" }, // [4]+ (clamps here forever)
+	{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" }, // [0] plan mode (every LLM call)
+	{ modelId: "gpt-5.5", thinking: "xhigh", webSearchContextSize: "high" }, // [1] first call after plan accepted
+	{ modelId: "gpt-5.5", thinking: "high", webSearchContextSize: "medium" }, // [2]
+	{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "medium" }, // [3]
+	{ modelId: "gpt-5.4", thinking: "medium", webSearchContextSize: "medium" }, // [4]
+	{ modelId: "gpt-5.4", thinking: "medium", webSearchContextSize: "low" }, // [5]
+	{ modelId: "gpt-5.2", thinking: "high", webSearchContextSize: "low" }, // [6]
+	{ modelId: "gpt-5.2", thinking: "medium", webSearchContextSize: "low" }, // [7]+ (clamps here forever)
 ];
 
 // Tools available during planning — read-only.
 const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls"];
-const EXEC_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const IMPL_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 const PLAN_PROMPT = `[PLAN MODE]
 
@@ -86,8 +156,8 @@ perspectives. You're collaborating on this codebase together.
 
 Be humble and questioning. Practice thinking before talking. Be completely
 honest at all times, state your assumptions, and if you're uncertain say
-so — and if possible, look it up via file search or web search (web is via
-\`bash\` + \`curl\` in this environment).
+so — and if possible, look it up via file search, native OpenAI web search
+when available, or \`bash\` + \`curl\` as a fallback.
 
 # Principles (apply throughout, with reasonable exceptions)
 
@@ -131,7 +201,8 @@ In PLAN MODE you do Research & Analysis ONLY:
 * Read files and examine code (\`read\`)
 * Search through the codebase (\`grep\`, \`find\`, \`ls\`)
 * Analyze project structure
-* Gather information from the web via \`bash\` + \`curl\`
+* Gather information from the web using native OpenAI web search when
+  available, or \`bash\` + \`curl\` as a fallback
 * Review documentation files
 * Look at git history via \`bash\` (\`git log\`, \`git blame\`, \`git diff\`)
 
@@ -149,6 +220,9 @@ what caught your eye or wasn't what you expected.
 
 When you're ready, present (in this order):
 
+When using web search, cite the important sources explicitly in your normal
+response text.
+
 1. **Summary and purpose** of the task from your point of view
 2. **Overall changes** needed in the codebase to reach the goal
 3. **Risk assessment** — the scenarios you considered, the risks in
@@ -156,7 +230,7 @@ When you're ready, present (in this order):
 4. **Confidence level** — your honest read on how certain the plan is
    right
 5. **Step-by-step plan** under a heading "Plan:" — one numbered line per
-   step (this is what the executing phase will work from)
+   step (this is what the implementation phase will work from)
 
 Keep the plan to a high architectural standard — DRY, KISS, separation
 of concerns.
@@ -165,8 +239,9 @@ of concerns.
 
 The user will see a dialog with three choices:
 
-* **Execute the plan** — the extension auto-sends "Execute the plan."
-  and you switch to implementation mode (with edit/write restored)
+* **Start implementation** — the extension auto-sends "Please start
+  implementation." and you switch to implementation mode (with edit/write
+  restored)
 * **Refine — stay in plan mode** — you stay here; the user will give
   more feedback
 * **Cancel — leave plan mode** — drops back to normal pi
@@ -175,7 +250,7 @@ When revising the plan based on feedback, restate the WHOLE plan so the
 user can track the diff between revisions and the conclusions reached
 during planning.`;
 
-const EXEC_FIRST_PROMPT = `[EXECUTING PLAN]
+const IMPL_FIRST_PROMPT = `[IMPLEMENTATION MODE]
 
 The user has approved the plan you produced. Edit and write tools are
 available again. Implement the plan you laid out, applying the same
@@ -216,8 +291,12 @@ Then summarize what changed and report back.`;
 export default function planStepdownExtension(pi: ExtensionAPI): void {
 	let mode: Mode = "idle";
 	// Single global counter. 0 during planning, set to 1 on accept,
-	// incremented at every turn_end during executing (clamped to ladder end).
+	// incremented at every turn_end during implementing (clamped to ladder end).
 	let stage = 0;
+
+	// One-shot bump state.
+	let pendingBump: { rungIndex: number; reason: string } | null = null;
+	let activeBump: { rungIndex: number; reason: string } | null = null;
 
 	function rungLabel(rung: Rung, idx: number): string {
 		return `[${idx}] ${PROVIDER}/${rung.modelId}:${rung.thinking}`;
@@ -229,8 +308,62 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		return Math.min(stage, LADDER.length - 1);
 	}
 
+	function effectiveRungIndexForStatus(): number {
+		if (mode === "idle") return -1;
+		if (mode === "planning") return 0;
+		if (activeBump) return activeBump.rungIndex;
+		return activeRungIndex();
+	}
+
 	function persist(): void {
 		pi.appendEntry("plan-stepdown-state", { mode, stage });
+	}
+
+	function getLocalUsername(): string {
+		try {
+			const username = userInfo().username;
+			if (username) return username;
+		} catch {
+			// Fall back below. userInfo() can fail in restricted environments.
+		}
+		return process.env.USER || process.env.USERNAME || process.env.LOGNAME || "unknown";
+	}
+
+	function getPromptCacheKey(ctx: ExtensionContext): string {
+		return createPromptCacheKey(OPENAI_PROMPT_CACHE_KEY_PREFIX, getLocalUsername(), ctx.cwd);
+	}
+
+	function normalizeCountry(country: string | undefined): string | undefined {
+		if (!country) return undefined;
+		const normalized = country.trim().toUpperCase();
+		return /^[A-Z]{2}$/.test(normalized) ? normalized : undefined;
+	}
+
+	function normalizeTimezone(timezone: string | undefined): string | undefined {
+		const normalized = timezone?.trim();
+		return normalized && normalized.length > 0 ? normalized : undefined;
+	}
+
+	function detectSystemTimezone(): string | undefined {
+		try {
+			return normalizeTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+		} catch {
+			return undefined;
+		}
+	}
+
+	function countryFromTimezone(timezone: string | undefined): string | undefined {
+		if (!timezone) return undefined;
+		return TIMEZONE_COUNTRY[timezone];
+	}
+
+	function getOpenAIWebSearchUserLocation(): OpenAIWebSearchUserLocation | undefined {
+		if (!OPENAI_WEB_SEARCH_LOCATION_ENABLED) return undefined;
+		const timezone = normalizeTimezone(process.env.PI_OPENAI_WEB_SEARCH_TIMEZONE) ?? detectSystemTimezone();
+		const country =
+			normalizeCountry(process.env.PI_OPENAI_WEB_SEARCH_COUNTRY) ?? countryFromTimezone(timezone);
+		if (!timezone && !country) return undefined;
+		return { type: "approximate", ...(country ? { country } : {}), ...(timezone ? { timezone } : {}) };
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -238,11 +371,21 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			ctx.ui.setStatus("plan-stepdown", undefined);
 			return;
 		}
-		const idx = activeRungIndex();
+		const idx = effectiveRungIndexForStatus();
 		const rung = LADDER[idx];
 		const color = mode === "planning" ? "warning" : "accent";
-		const icon = mode === "planning" ? "📋 plan" : "▶ exec";
-		const label = `${icon} ${rungLabel(rung, idx)} (${idx + 1}/${LADDER.length})`;
+		const icon = mode === "planning" ? "📋 plan" : "▶ impl";
+
+		let suffix = "";
+		if (mode === "implementing") {
+			if (activeBump) {
+				suffix = ` ↑ ${activeBump.reason}`;
+			} else if (pendingBump) {
+				suffix = ` next↑ ${pendingBump.reason}`;
+			}
+		}
+
+		const label = `${icon} ${rungLabel(rung, idx)} (${idx + 1}/${LADDER.length})${suffix}`;
 		ctx.ui.setStatus("plan-stepdown", ctx.ui.theme.fg(color, label));
 	}
 
@@ -280,7 +423,9 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	function reset(ctx: ExtensionContext): void {
 		mode = "idle";
 		stage = 0;
-		pi.setActiveTools(EXEC_TOOLS);
+		pendingBump = null;
+		activeBump = null;
+		pi.setActiveTools(IMPL_TOOLS);
 		updateStatus(ctx);
 		persist();
 	}
@@ -293,6 +438,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		handler: async (_args, ctx) => {
 			mode = "planning";
 			stage = 0;
+			pendingBump = null;
+			activeBump = null;
 			pi.setActiveTools(PLAN_TOOLS);
 			const ok = await bindProviderForRung(LADDER[0], ctx);
 			if (!ok) {
@@ -347,12 +494,44 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 				message: { customType: "plan-stepdown-context", content: PLAN_PROMPT, display: false },
 			};
 		}
-		if (mode === "executing" && stage === 1) {
-			// Only inject "executing" prompt at the very first executing turn.
+		if (mode === "implementing" && stage === 1) {
+			// Only inject the implementation-mode prompt at the very first
+			// implementing turn.
 			return {
-				message: { customType: "plan-stepdown-context", content: EXEC_FIRST_PROMPT, display: false },
+				message: { customType: "plan-stepdown-context", content: IMPL_FIRST_PROMPT, display: false },
 			};
 		}
+	});
+
+	// -------------------------------------------------------------------------
+	// turn_start: if a bump is queued, arm it for this turn.
+	// -------------------------------------------------------------------------
+	pi.on("turn_start", async (_event, ctx) => {
+		if (mode !== "implementing") return;
+		if (!pendingBump) return;
+		activeBump = pendingBump;
+		pendingBump = null;
+		updateStatus(ctx);
+	});
+
+	// -------------------------------------------------------------------------
+	// tool_result: detect important outputs/errors and queue a one-shot bump for
+	// the *next* LLM call.
+	// -------------------------------------------------------------------------
+	pi.on("tool_result", async (event, ctx) => {
+		if (mode !== "implementing") return;
+
+		const reason = detectReasoningBump(
+			{ toolName: event.toolName, input: event.input, isError: event.isError },
+			REASONING_BUMP,
+		);
+		if (!reason) return;
+
+		if (LADDER.length === 0) return;
+		const bumpIndex = Math.min(BUMP_RUNG_INDEX, LADDER.length - 1);
+
+		pendingBump = { rungIndex: bumpIndex, reason };
+		updateStatus(ctx);
 	});
 
 	// -------------------------------------------------------------------------
@@ -360,22 +539,49 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// payload's model + reasoning to LADDER[active]. Returning the
 	// rewritten payload replaces what gets sent.
 	// -------------------------------------------------------------------------
-	pi.on("before_provider_request", (event) => {
-		const rung = chooseRung(mode, stage, LADDER);
+	pi.on("before_provider_request", (event, ctx) => {
+		const rung = activeBump ? LADDER[activeBump.rungIndex] : chooseRung(mode, stage, LADDER);
 		if (!rung) return;
-		return applyRungToPayload(event.payload, rung);
+
+		let payload = applyRungToPayload(event.payload, rung);
+		const model = ctx.modelRegistry.find(PROVIDER, rung.modelId);
+
+		const webSearchEnabled = OPENAI_WEB_SEARCH_ENABLED && model?.api === "openai-responses";
+		payload = applyOpenAIWebSearchToPayload(payload, {
+			enabled: webSearchEnabled,
+			contextSize: rung.webSearchContextSize ?? "low",
+			userLocation: webSearchEnabled ? getOpenAIWebSearchUserLocation() : undefined,
+		});
+
+		const supportsLongCacheRetention = model?.compat?.supportsLongCacheRetention ?? true;
+		const promptCacheRetention =
+			OPENAI_PROMPT_CACHE_RETENTION === "24h" && !supportsLongCacheRetention
+				? undefined
+				: OPENAI_PROMPT_CACHE_RETENTION;
+
+		payload = applyPromptCacheToPayload(payload, {
+			key: getPromptCacheKey(ctx),
+			retention: promptCacheRetention,
+		});
+		return payload;
 	});
 
 	// -------------------------------------------------------------------------
-	// turn_end: advance the stage counter during executing. Don't advance on
-	// aborted turns so /resume continues at the same rung.
+	// turn_end: advance the stage counter during implementing. Don't advance
+	// on aborted turns so /resume continues at the same rung.
 	// -------------------------------------------------------------------------
 	pi.on("turn_end", async (event, ctx) => {
-		if (mode !== "executing") return;
+		if (mode !== "implementing") return;
 		const stop = (event.message as { stopReason?: string } | undefined)?.stopReason;
 		if (stop === "aborted") return;
 
-		stage = Math.min(stage + 1, LADDER.length - 1);
+		// If a bump was active for this turn, advance from the bumped rung
+		// (so a bump on [1] continues at [2]). Otherwise advance from the
+		// current stage as normal.
+		const activeBumpIndex = activeBump?.rungIndex;
+		activeBump = null;
+
+		stage = nextStage(activeBumpIndex ?? stage, LADDER);
 		updateStatus(ctx);
 		persist();
 	});
@@ -383,18 +589,21 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// -------------------------------------------------------------------------
 	// agent_end: two distinct cases.
 	//
-	//   planning  → show the accept dialog. On accept, jump stage to 1 so
-	//               the auto-injected "Execute the plan." run starts at
-	//               LADDER[1] (carrying the plan forward into autonomous
-	//               work). On cancel, reset.
+	//   planning      → show the accept dialog. On accept, jump stage to 1
+	//                   so the auto-injected "Please start implementation."
+	//                   run starts at LADDER[1] (carrying the plan forward
+	//                   into autonomous work). On cancel, reset.
 	//
-	//   executing → control is going back to the user. Reset stage to 0 so
-	//               their next prompt starts at the snappy/user-facing
-	//               tier again. Stepping only happens inside one run.
+	//   implementing  → control is going back to the user. Reset stage to 0
+	//                   so their next prompt starts at the snappy/user-
+	//                   facing tier again. Stepping only happens inside one
+	//                   run.
 	// -------------------------------------------------------------------------
 	pi.on("agent_end", async (_event, ctx) => {
-		if (mode === "executing") {
+		if (mode === "implementing") {
 			stage = 0;
+			pendingBump = null;
+			activeBump = null;
 			updateStatus(ctx);
 			persist();
 			return;
@@ -404,19 +613,21 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (!ctx.hasUI) return;
 
 		const choice = await ctx.ui.select("Plan ready — what next?", [
-			"Execute the plan",
+			"Start implementation",
 			"Refine — stay in plan mode",
 			"Cancel — leave plan mode",
 		]);
 
-		if (choice === "Execute the plan") {
-			mode = "executing";
+		if (choice === "Start implementation") {
+			mode = "implementing";
 			stage = 1;
-			pi.setActiveTools(EXEC_TOOLS);
+			pendingBump = null;
+			activeBump = null;
+			pi.setActiveTools(IMPL_TOOLS);
 			updateStatus(ctx);
 			persist();
 			pi.sendMessage(
-				{ customType: "plan-stepdown-execute", content: "Execute the plan.", display: true },
+				{ customType: "plan-stepdown-implement", content: "Please start implementation.", display: true },
 				{ triggerTurn: true },
 			);
 		} else if (choice === "Cancel — leave plan mode") {
@@ -439,6 +650,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (last?.data) {
 			mode = last.data.mode;
 			stage = last.data.stage;
+			pendingBump = null;
+			activeBump = null;
 			if (mode === "planning") pi.setActiveTools(PLAN_TOOLS);
 			updateStatus(ctx);
 		}

@@ -13,9 +13,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	applyOpenAIWebSearchToPayload,
+	applyPromptCacheToPayload,
 	applyRungToPayload,
 	chooseRung,
+	createPromptCacheKey,
 	detectApi,
+	detectReasoningBump,
+	nextStage,
+	startsWithShellCommand,
+	type ReasoningBumpConfig,
 	type Rung,
 } from "./rewrite.ts";
 
@@ -246,6 +253,366 @@ test("non-object payload: passes through unchanged", () => {
 });
 
 // ============================================================================
+// createPromptCacheKey
+// ============================================================================
+
+test("createPromptCacheKey: hashes username + cwd with visible prefix", () => {
+	const a = createPromptCacheKey("pi-model-staging:", "alice", "/repo/a");
+	const b = createPromptCacheKey("pi-model-staging:", "alice", "/repo/a");
+	const c = createPromptCacheKey("pi-model-staging:", "alice", "/repo/b");
+	const d = createPromptCacheKey("pi-model-staging:", "bob", "/repo/a");
+
+	assert.equal(a, b);
+	assert.match(a, /^pi-model-staging:[0-9a-f]{32}$/);
+	assert.notEqual(a, c);
+	assert.notEqual(a, d);
+	assert.ok(!a.includes("alice"));
+	assert.ok(!a.includes("/repo/a"));
+});
+
+// ============================================================================
+// applyOpenAIWebSearchToPayload — OpenAI Responses hosted web search
+// ============================================================================
+
+test("web search: openai-responses appends web_search tool and sets tool_choice auto", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+		tools: [{ type: "function", name: "read", parameters: {} }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, {
+		enabled: true,
+		contextSize: "medium",
+		userLocation: { type: "approximate", country: "SE", timezone: "Europe/Stockholm" },
+	}) as Record<string, unknown>;
+	assert.equal(out.model, "gpt-5.5");
+	assert.equal(out.tool_choice, "auto");
+	assert.ok(Array.isArray(out.tools));
+	const tools = out.tools as Array<Record<string, unknown>>;
+	assert.equal(tools.length, 2);
+	assert.equal(tools[0]?.type, "function");
+	assert.equal(tools[1]?.type, "web_search");
+	assert.equal(tools[1]?.search_context_size, "medium");
+	assert.deepEqual(tools[1]?.user_location, { type: "approximate", country: "SE", timezone: "Europe/Stockholm" });
+});
+
+test("web search: preserves existing tool_choice", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tool_choice: "required",
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "low" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.tool_choice, "required");
+});
+
+test("web search: disabled option and non-object payloads pass through unchanged", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	assert.deepEqual(applyOpenAIWebSearchToPayload(original, { enabled: false, contextSize: "high" }), original);
+	assert.equal(applyOpenAIWebSearchToPayload(null, { enabled: true, contextSize: "high" }), null);
+	assert.equal(applyOpenAIWebSearchToPayload("oops", { enabled: true, contextSize: "high" }), "oops");
+});
+
+test("web search: does not duplicate if web_search already present", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tools: [{ type: "web_search", search_context_size: "low" }],
+		tool_choice: "auto",
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "high" }) as Record<
+		string,
+		unknown
+	>;
+	assert.ok(Array.isArray(out.tools));
+	assert.equal((out.tools as unknown[]).length, 1);
+});
+
+test("web search: does not duplicate if web_search_preview already present", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tools: [{ type: "web_search_preview" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "high" }) as Record<
+		string,
+		unknown
+	>;
+	assert.ok(Array.isArray(out.tools));
+	assert.equal((out.tools as unknown[]).length, 1);
+});
+
+test("web search: openai-completions payload unchanged", () => {
+	const original = {
+		model: "gpt-4o",
+		messages: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "high" });
+	assert.deepEqual(out, original);
+});
+
+test("web search: contextSize off disables injection", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "off" });
+	assert.deepEqual(out, original);
+});
+
+test("web search: omits user_location when not provided", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "low" }) as Record<string, unknown>;
+	const tools = (out.tools as Array<Record<string, unknown>> | undefined) ?? [];
+	const ws = tools.find((t) => t?.type === "web_search");
+	assert.ok(ws);
+	assert.equal(ws?.user_location, undefined);
+});
+
+test("web search: omits user_location when provided but empty", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+	};
+	const out = applyOpenAIWebSearchToPayload(original, {
+		enabled: true,
+		contextSize: "low",
+		userLocation: { type: "approximate" },
+	}) as Record<string, unknown>;
+	const tools = (out.tools as Array<Record<string, unknown>> | undefined) ?? [];
+	const ws = tools.find((t) => t?.type === "web_search");
+	assert.ok(ws);
+	assert.equal(ws?.user_location, undefined);
+});
+
+test("web search: does not mutate input", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		tools: [{ type: "function", name: "read", parameters: {} }],
+	};
+	const snapshot = JSON.parse(JSON.stringify(original));
+	applyOpenAIWebSearchToPayload(original, { enabled: true, contextSize: "low" });
+	assert.deepEqual(original, snapshot);
+});
+
+// ============================================================================
+// applyPromptCacheToPayload — OpenAI prompt caching (augmentation)
+// ============================================================================
+
+test("prompt cache: openai-responses with pi-set key augments retention (the common path)", () => {
+	// Realistic: pi has set prompt_cache_key from sessionId. Our extension
+	// supplies the longer 24h retention on top. Both fields must end up in
+	// the wire payload.
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+		prompt_cache_key: "pi-session-id-abc",
+	};
+	const out = applyPromptCacheToPayload(original, { key: "should-not-override", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, "pi-session-id-abc"); // pi's key preserved
+	assert.equal(out.prompt_cache_retention, "24h"); // retention augmented
+	// preserved
+	assert.equal(out.model, "gpt-5.5");
+	assert.deepEqual(out.input, original.input);
+});
+
+test("prompt cache: openai-completions adds prompt_cache_key only when retention omitted", () => {
+	const original = {
+		model: "gpt-4o",
+		messages: [{ role: "user", content: "hi" }],
+		stream: true,
+		// pi has set the key but not the retention — partial signal, NOT
+		// "disabled". Augment retention only.
+		prompt_cache_key: "pi-session-existing",
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-456" }) as Record<string, unknown>;
+	assert.equal(out.prompt_cache_key, "pi-session-existing");
+	assert.equal(out.prompt_cache_retention, undefined);
+});
+
+test("prompt cache: respects pi-disabled caching (both fields undefined → pass through)", () => {
+	// When pi has cacheRetention: "none" in settings, it leaves BOTH
+	// prompt_cache_key and prompt_cache_retention undefined. We must not
+	// silently re-enable caching by injecting our key — see the comment
+	// in applyPromptCacheToPayload.
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+	};
+	const out = applyPromptCacheToPayload(original, { key: "should-not-be-injected", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, undefined);
+	assert.equal(out.prompt_cache_retention, undefined);
+});
+
+test("prompt cache: pi set retention but not key → augment key only (still treats as enabled)", () => {
+	// Edge: pi set retention but not key. That's not the "disabled" signal
+	// (which is BOTH undefined), so we should still augment the key.
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		prompt_cache_retention: "in_memory",
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-abc", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, "session-abc");
+	assert.equal(out.prompt_cache_retention, "in_memory");
+});
+
+test("prompt cache: preserves existing provider fields (including null)", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		prompt_cache_key: null,
+		prompt_cache_retention: "24h",
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-should-not-override", retention: "24h" }) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(out.prompt_cache_key, null);
+	assert.equal(out.prompt_cache_retention, "24h");
+});
+
+test("prompt cache: non-openai payload passes through unchanged", () => {
+	const original = {
+		model: "gemini",
+		contents: [{ role: "user", parts: [{ text: "hi" }] }],
+	};
+	const out = applyPromptCacheToPayload(original, { key: "session-1", retention: "24h" });
+	assert.deepEqual(out, original);
+});
+
+test("prompt cache: does not mutate input", () => {
+	const original = {
+		model: "gpt-5.5",
+		input: [{ role: "user", content: "hi" }],
+		stream: true,
+	};
+	const snapshot = JSON.parse(JSON.stringify(original));
+	applyPromptCacheToPayload(original, { key: "session-123", retention: "24h" });
+	assert.deepEqual(original, snapshot);
+});
+
+// ============================================================================
+// Reasoning bumps — trigger detection
+// ============================================================================
+
+test("startsWithShellCommand: matches only at start (after whitespace)", () => {
+	assert.equal(startsWithShellCommand("npm test", "npm"), true);
+	assert.equal(startsWithShellCommand("  npm   run build", "npm"), true);
+	assert.equal(startsWithShellCommand("npm", "npm"), true);
+	assert.equal(startsWithShellCommand("pnpm test", "npm"), false);
+	assert.equal(startsWithShellCommand("echo npm test", "npm"), false);
+	assert.equal(startsWithShellCommand("cd x && npm test", "npm"), false);
+});
+
+const BUMP_CFG: ReasoningBumpConfig = {
+	bumpOnFailedBash: true,
+	bumpOnFailedTool: true,
+	bumpOnPackageManagerCommand: true,
+	packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
+};
+
+test("detectReasoningBump: bumps on failed bash", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: true }, BUMP_CFG),
+		"failed bash command",
+	);
+});
+
+test("detectReasoningBump: bumps on npm output even when successful", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "npm test" }, isError: false }, BUMP_CFG),
+		"npm command result",
+	);
+});
+
+test("detectReasoningBump: bumps on other package managers", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "pnpm test" }, isError: false }, BUMP_CFG),
+		"pnpm command result",
+	);
+});
+
+test("detectReasoningBump: no bump for non-matching bash", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "bash", input: { command: "git status" }, isError: false }, BUMP_CFG),
+		null,
+	);
+});
+
+test("detectReasoningBump: bumps on failed edit tool", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "edit", input: { path: "a.txt" }, isError: true }, BUMP_CFG),
+		"failed edit tool",
+	);
+});
+
+test("detectReasoningBump: no bump for successful edit tool", () => {
+	assert.equal(
+		detectReasoningBump({ toolName: "edit", input: { path: "a.txt" }, isError: false }, BUMP_CFG),
+		null,
+	);
+});
+
+test("detectReasoningBump: can disable non-bash failed-tool bump", () => {
+	const cfg: ReasoningBumpConfig = { ...BUMP_CFG, bumpOnFailedTool: false };
+	assert.equal(detectReasoningBump({ toolName: "edit", input: { path: "a.txt" }, isError: true }, cfg), null);
+	// Still bumps bash failures.
+	assert.equal(detectReasoningBump({ toolName: "bash", input: { command: "false" }, isError: true }, cfg), "failed bash command");
+});
+
+const STAGE_LADDER: Rung[] = [
+	{ modelId: "r0", thinking: "high" },
+	{ modelId: "r1", thinking: "high" },
+	{ modelId: "r2", thinking: "high" },
+	{ modelId: "r3", thinking: "high" },
+];
+
+test("nextStage: advances by one, clamped to last rung", () => {
+	assert.equal(nextStage(0, STAGE_LADDER), 1);
+	assert.equal(nextStage(2, STAGE_LADDER), 3);
+	assert.equal(nextStage(3, STAGE_LADDER), 3); // clamped
+	assert.equal(nextStage(99, STAGE_LADDER), 3); // far past end
+});
+
+test("nextStage: post-bump caller passes the bump index — advance from there", () => {
+	// Caller-side composition: nextStage(activeBumpIndex ?? stage, ladder)
+	// A bump on [1] should resume at [2] regardless of where stage was.
+	assert.equal(nextStage(1, STAGE_LADDER), 2);
+});
+
+test("nextStage: ladder size 1 stays at 0", () => {
+	const ladder: Rung[] = [{ modelId: "only", thinking: "high" }];
+	assert.equal(nextStage(0, ladder), 0);
+});
+
+test("nextStage: empty ladder returns 0", () => {
+	assert.equal(nextStage(5, []), 0);
+});
+
+// ============================================================================
 // chooseRung — mode/stage dispatch
 // ============================================================================
 
@@ -263,7 +630,7 @@ test("chooseRung: idle → null", () => {
 
 test("chooseRung: empty ladder → null", () => {
 	assert.equal(chooseRung("planning", 0, []), null);
-	assert.equal(chooseRung("executing", 5, []), null);
+	assert.equal(chooseRung("implementing", 5, []), null);
 });
 
 test("chooseRung: planning always returns LADDER[0] regardless of stage", () => {
@@ -272,41 +639,41 @@ test("chooseRung: planning always returns LADDER[0] regardless of stage", () => 
 	assert.deepEqual(chooseRung("planning", 99, LADDER), LADDER[0]);
 });
 
-test("chooseRung: executing returns LADDER[stage]", () => {
-	assert.deepEqual(chooseRung("executing", 0, LADDER), LADDER[0]);
-	assert.deepEqual(chooseRung("executing", 1, LADDER), LADDER[1]);
-	assert.deepEqual(chooseRung("executing", 2, LADDER), LADDER[2]);
-	assert.deepEqual(chooseRung("executing", 3, LADDER), LADDER[3]);
+test("chooseRung: implementing returns LADDER[stage]", () => {
+	assert.deepEqual(chooseRung("implementing", 0, LADDER), LADDER[0]);
+	assert.deepEqual(chooseRung("implementing", 1, LADDER), LADDER[1]);
+	assert.deepEqual(chooseRung("implementing", 2, LADDER), LADDER[2]);
+	assert.deepEqual(chooseRung("implementing", 3, LADDER), LADDER[3]);
 });
 
-test("chooseRung: executing past the end clamps to last", () => {
-	assert.deepEqual(chooseRung("executing", 4, LADDER), LADDER[3]);
-	assert.deepEqual(chooseRung("executing", 99, LADDER), LADDER[3]);
+test("chooseRung: implementing past the end clamps to last", () => {
+	assert.deepEqual(chooseRung("implementing", 4, LADDER), LADDER[3]);
+	assert.deepEqual(chooseRung("implementing", 99, LADDER), LADDER[3]);
 });
 
-test("chooseRung: executing with negative stage clamps to first", () => {
-	assert.deepEqual(chooseRung("executing", -1, LADDER), LADDER[0]);
+test("chooseRung: implementing with negative stage clamps to first", () => {
+	assert.deepEqual(chooseRung("implementing", -1, LADDER), LADDER[0]);
 });
 
 // ============================================================================
-// End-to-end lifecycle: simulate the full plan→exec→follow-up flow and
+// End-to-end lifecycle: simulate the full plan→implement→follow-up flow and
 // confirm each LLM call gets the right rung's model + effort.
 //
 // The state machine driving stage transitions lives in index.ts, but the
 // rules are simple enough to encode inline here:
 //
-//   /plan                          mode=planning, stage=0
-//   turn_end during executing      stage = min(stage+1, len-1)
-//   accept                         mode=executing, stage=1
-//   agent_end during executing     stage=0
+//   /plan                              mode=planning, stage=0
+//   turn_end during implementing       stage = min(stage+1, len-1)
+//   accept                             mode=implementing, stage=1
+//   agent_end during implementing      stage=0
 // ============================================================================
 
 test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 	const ladder: Rung[] = [
-		{ modelId: "gpt-5.5:quick", thinking: "xhigh" },
-		{ modelId: "gpt-5.5", thinking: "xhigh" },
-		{ modelId: "gpt-5.5", thinking: "high" },
-		{ modelId: "gpt-5.4", thinking: "high" },
+		{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" },
+		{ modelId: "gpt-5.5", thinking: "xhigh", webSearchContextSize: "high" },
+		{ modelId: "gpt-5.5", thinking: "high", webSearchContextSize: "medium" },
+		{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "low" },
 	];
 	const basePayload = () => ({
 		model: "ignored",
@@ -316,20 +683,31 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 	});
 
 	const seen: string[] = [];
+	const seenSearch: Array<string | undefined> = [];
 
-	function fire(mode: "planning" | "executing", stage: number) {
+	function fire(mode: "planning" | "implementing", stage: number) {
 		const rung = chooseRung(mode, stage, ladder);
 		assert.ok(rung);
-		const out = applyRungToPayload(basePayload(), rung) as {
+		const out = applyRungToPayload(basePayload(), rung) as Record<string, unknown> & {
 			model: string;
 			reasoning: { effort: string };
 		};
 		seen.push(`${out.model}:${out.reasoning.effort}`);
+
+		// Web search context size follows the rung's setting.
+		const withSearch = applyOpenAIWebSearchToPayload(out, {
+			enabled: true,
+			contextSize: rung.webSearchContextSize,
+		}) as Record<string, unknown>;
+		const tools = (withSearch.tools as Array<Record<string, unknown>> | undefined) ?? [];
+		const ws = tools.find((t) => t?.type === "web_search");
+		seenSearch.push(ws ? String(ws.search_context_size) : undefined);
+
 		return rung;
 	}
 
 	// /plan → mode=planning, stage=0
-	let mode: "planning" | "executing" = "planning";
+	let mode: "planning" | "implementing" = "planning";
 	let stage = 0;
 
 	// Plan run with 3 turns (LLM does some reads, asks for clarification).
@@ -338,17 +716,18 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 	fire(mode, stage); // turn 3
 	// agent_end during planning fires the dialog (no stage mutation here).
 
-	// Accept → mode=executing, stage=1, "Execute the plan." auto-prompt fires.
-	mode = "executing";
+	// Accept → mode=implementing, stage=1, "Please start implementation."
+	// auto-prompt fires.
+	mode = "implementing";
 	stage = 1;
 
-	// Executing run #1: 4 turns. stage advances at each turn_end.
+	// Implementing run #1: 4 turns. stage advances at each turn_end.
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 1
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 2
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 3
 	fire(mode, stage); stage = Math.min(stage + 1, ladder.length - 1); // turn 4 (clamped)
 
-	// agent_end during executing → reset stage to 0.
+	// agent_end during implementing → reset stage to 0.
 	stage = 0;
 
 	// User follow-up "also do X". Run #2: 3 turns.
@@ -367,7 +746,7 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 		"gpt-5.5:quick:xhigh",
 		"gpt-5.5:quick:xhigh",
 		"gpt-5.5:quick:xhigh",
-		// Execute the plan run: starts at LADDER[1], steps to [3], then clamps.
+		// Start implementation run: starts at LADDER[1], steps to [3], then clamps.
 		"gpt-5.5:xhigh",
 		"gpt-5.5:high",
 		"gpt-5.4:high",
@@ -378,5 +757,105 @@ test("end-to-end: full lifecycle uses correct rung at every LLM call", () => {
 		"gpt-5.5:high",
 		// Follow-up #2 single turn: LADDER[0].
 		"gpt-5.5:quick:xhigh",
+	]);
+
+	assert.deepEqual(seenSearch, [
+		// Plan run: LADDER[0] repeated.
+		"high",
+		"high",
+		"high",
+		// Start implementation run: [1] → [2] → [3] → [3] clamped.
+		"high",
+		"medium",
+		"low",
+		"low",
+		// Follow-up #1: [0] → [1] → [2].
+		"high",
+		"high",
+		"medium",
+		// Follow-up #2: [0].
+		"high",
+	]);
+});
+
+// ============================================================================
+// End-to-end with reasoning bump: simulate an implementing run where a bash
+// failure mid-stream triggers a one-shot bump, then confirm the bumped turn
+// uses LADDER[1] AND the next normal turn resumes at LADDER[2] (not back at
+// the pre-bump stage cursor).
+//
+// State machine (subset relevant here):
+//   tool_result trigger     pendingBump = { rungIndex: BUMP_RUNG_INDEX }
+//   turn_start               activeBump = pendingBump; pendingBump = null
+//   before_provider_request  rung = activeBump ? LADDER[bump] : LADDER[stage]
+//   turn_end                 stage = nextStage(activeBump?.rungIndex ?? stage, ladder)
+//                            activeBump = null
+// ============================================================================
+
+test("end-to-end with bump: bumped turn uses LADDER[1], next turn resumes at LADDER[2]", () => {
+	const ladder: Rung[] = [
+		{ modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] never reached here
+		{ modelId: "gpt-5.5", thinking: "xhigh" }, // [1] post-accept + bump target
+		{ modelId: "gpt-5.5", thinking: "high" }, // [2] post-bump resume
+		{ modelId: "gpt-5.4", thinking: "high" }, // [3]
+	];
+	const BUMP_INDEX = Math.min(1, ladder.length - 1);
+
+	const basePayload = () => ({
+		model: "ignored",
+		input: [{ role: "user", content: "x" }],
+		stream: true,
+		reasoning: { effort: "ignored", summary: "auto" },
+	});
+
+	const seen: string[] = [];
+	let stage = 1; // accept just happened
+	let pendingBump: { rungIndex: number } | null = null;
+	let activeBump: { rungIndex: number } | null = null;
+
+	function fireTurn() {
+		// turn_start: arm the bump if queued.
+		if (pendingBump) {
+			activeBump = pendingBump;
+			pendingBump = null;
+		}
+		// before_provider_request: bump wins over normal stage.
+		const rung = activeBump
+			? ladder[activeBump.rungIndex]
+			: chooseRung("implementing", stage, ladder);
+		assert.ok(rung);
+		const out = applyRungToPayload(basePayload(), rung) as {
+			model: string;
+			reasoning: { effort: string };
+		};
+		seen.push(`${out.model}:${out.reasoning.effort}`);
+		// turn_end: advance stage from bump target if there was one.
+		const activeBumpIndex = activeBump?.rungIndex;
+		activeBump = null;
+		stage = nextStage(activeBumpIndex ?? stage, ladder);
+	}
+
+	// Turn 1: normal post-accept turn. Should use LADDER[1].
+	fireTurn();
+
+	// Between turns 2 and 3 the agent ran `npm test` and the result fired a
+	// bump trigger. Queue it before turn 2 starts.
+	pendingBump = { rungIndex: BUMP_INDEX };
+
+	// Turn 2: bump active. Should use LADDER[1] (the bump target).
+	fireTurn();
+
+	// Turn 3: no new bump. Stage was advanced from bump index (1) → 2.
+	// Should use LADDER[2].
+	fireTurn();
+
+	// Turn 4: continues stepping down to LADDER[3].
+	fireTurn();
+
+	assert.deepEqual(seen, [
+		"gpt-5.5:xhigh", // turn 1: LADDER[1] (post-accept default)
+		"gpt-5.5:xhigh", // turn 2: LADDER[1] (bump target — same value here, but bump path used)
+		"gpt-5.5:high", // turn 3: LADDER[2] (resumed AFTER the bump rung, not from pre-bump stage)
+		"gpt-5.4:high", // turn 4: LADDER[3]
 	]);
 });

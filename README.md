@@ -1,6 +1,6 @@
 # pi-model-staging
 
-A [pi](https://pi.dev) extension that adds a **plan-then-execute** workflow
+A [pi](https://pi.dev) extension that adds a **plan-then-implement** workflow
 with a **single configurable model ladder**. The model and reasoning level
 step down as the agent grinds through tool calls "by itself", and snap back
 to the snappy/user-facing tier whenever control returns to you.
@@ -13,27 +13,30 @@ user → reset to the top.**
 
 ```ts
 const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] snappy / user-facing
-    { modelId: "gpt-5.5",       thinking: "xhigh" }, // [1] first autonomous step
-    { modelId: "gpt-5.5",       thinking: "high"  }, // [2]
-    { modelId: "gpt-5.4",       thinking: "high"  }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high"  }, // [4]+ (last rung repeats)
+    { modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high"   }, // [0] snappy / user-facing
+    { modelId: "gpt-5.5",       thinking: "xhigh", webSearchContextSize: "high"   }, // [1] first autonomous step
+    { modelId: "gpt-5.5",       thinking: "high",  webSearchContextSize: "medium" }, // [2]
+    { modelId: "gpt-5.4",       thinking: "high",  webSearchContextSize: "low"    }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high",  webSearchContextSize: "low"    }, // [4]+ (last rung repeats)
 ];
 ```
 
 | Situation                                                            | Rung used   |
 |----------------------------------------------------------------------|-------------|
 | Plan mode (every LLM call while shaping the plan)                    | `LADDER[0]` |
-| Auto-injected "Execute the plan." run, turn 1                        | `LADDER[1]` |
+| Auto-injected "Please start implementation." run, turn 1             | `LADDER[1]` |
 | Same run, turn 2, 3, ...                                             | step down   |
-| `agent_end` during executing → user gets control back                | reset to 0  |
+| `agent_end` during implementing → user gets control back             | reset to 0  |
 | User follow-up prompt, turn 1 (LLM responding to user, "user-facing")| `LADDER[0]` |
 | Same prompt, turn 2, 3, ... (autonomous tool calls)                  | step down   |
+| Failed tool / bash / npm/pnpm/yarn/bun result during implementing   | bump next call to `LADDER[1]`, then continue at `LADDER[2]` |
 | Re-entering `/plan`                                                  | `LADDER[0]` |
 
 So `[0]` covers "user is in control or shaping the plan", `[1]` is "first
 step into autonomous work", and `[2..]` are progressive degradation as the
-agent keeps grinding without checking back in.
+agent keeps grinding without checking back in. Important tool results can
+restart that autonomous cursor from `[1]` so error/test interpretation gets
+stronger reasoning before stepping down again.
 
 ## How it actually works
 
@@ -44,10 +47,13 @@ and reuses them for every turn inside one agent run. Calling
 
 This extension uses two mechanisms together:
 
-1. **`pi.setModel()` once at `/plan`** — binds the provider, baseUrl, and
-   API key for every agent run that follows. We don't call it again, to
-   avoid pi's setModel side-effect of persisting a new default in your
-   settings.
+1. **`pi.setModel()` once per plan→implementation cycle, at `/plan`.**
+   Because every rung shares `PROVIDER`, that single binding carries the
+   provider, baseUrl, and API key through plan mode, the auto-injected
+   "Please start implementation." run, and any user follow-ups in
+   implementing mode. We deliberately don't call it again — pi persists
+   each `setModel()` as a default in `settings.json`, which would bounce
+   around per turn.
 2. **`before_provider_request` payload rewriting on every LLM call** —
    rewrites the wire payload's `model` and `reasoning_effort` /
    `reasoning.effort` / `output_config.effort` (depending on API) to
@@ -145,11 +151,11 @@ and edit the two things near the top:
 const PROVIDER = "openai-proxy";
 
 const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh" }, // [0] plan + user-facing
-    { modelId: "gpt-5.5",       thinking: "xhigh" }, // [1] first autonomous step
-    { modelId: "gpt-5.5",       thinking: "high"  }, // [2]
-    { modelId: "gpt-5.4",       thinking: "high"  }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high"  }, // [4]+ (clamps here forever)
+    { modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high"   }, // [0] plan + user-facing
+    { modelId: "gpt-5.5",       thinking: "xhigh", webSearchContextSize: "high"   }, // [1] first autonomous step
+    { modelId: "gpt-5.5",       thinking: "high",  webSearchContextSize: "medium" }, // [2]
+    { modelId: "gpt-5.4",       thinking: "high",  webSearchContextSize: "low"    }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high",  webSearchContextSize: "low"    }, // [4]+ (clamps here forever)
 ];
 ```
 
@@ -164,6 +170,9 @@ const LADDER: Rung[] = [
 - `thinking` — `"minimal" | "low" | "medium" | "high" | "xhigh"`.
   Auto-clamped to model capabilities (e.g. setting `xhigh` on a model that
   only supports `high` will silently drop to `high`).
+- `webSearchContextSize` — optional. `"low" | "medium" | "high" | "off"`.
+  Controls OpenAI Responses native `web_search` tool context size for this rung.
+  Use `"off"` to disable hosted search on a specific rung.
 
 ### Model and provider names
 
@@ -178,16 +187,30 @@ GPT-5.x model IDs (including `gpt-5.5:quick` for routing to a priority
 tier). Copy into `~/.pi/agent/models.json` (or merge into your existing
 file's `providers` map) and edit `baseUrl` / `apiKey` to match your setup.
 
-### Tools allowed in plan vs execute
+### Tools allowed in plan vs implementation
 
-Edit `PLAN_TOOLS` / `EXEC_TOOLS` in `index.ts` if the defaults don't match
+Edit `PLAN_TOOLS` / `IMPL_TOOLS` in `index.ts` if the defaults don't match
 your tool set. Default plan-mode tools are read-only: `read`, `bash`,
-`grep`, `find`, `ls`. Default execute tools add `edit` and `write`.
+`grep`, `find`, `ls`. Default implementation tools add `edit` and `write`.
+
+### Reasoning bump triggers
+
+Edit `REASONING_BUMP` in `index.ts` to change which tool results restart the
+autonomous cursor from `LADDER[1]` (or `LADDER[0]` for a one-rung ladder).
+Defaults:
+
+- failed bash commands (`isError: true`, including non-zero exit codes and timeouts)
+- failed non-bash tools (`isError: true`, e.g. `edit` exact-match failures)
+- bash commands that start with `npm`, `pnpm`, `yarn`, or `bun`
+
+After the bumped turn completes, normal stepping resumes at the rung after the
+bump. With the default ladder that means `[1]` for the bumped turn, then `[2]`,
+then `[3]`, and so on.
 
 ### System-prompt nudges
 
-Edit `PLAN_PROMPT` and `EXEC_FIRST_PROMPT` in `index.ts` to change the
-messages that get injected at the start of plan / execute phases.
+Edit `PLAN_PROMPT` and `IMPL_FIRST_PROMPT` in `index.ts` to change the
+messages that get injected at the start of plan / implementation phases.
 
 ## Usage
 
@@ -200,13 +223,13 @@ plan-stepdown: Plan mode ON. Every LLM call uses [0] openai-proxy/gpt-5.5:quick:
 
 [dialog appears]
 Plan ready — what next?
-  > Execute the plan
+  > Start implementation
     Refine — stay in plan mode
     Cancel — leave plan mode
 
-> Execute the plan
-[exec phase begins, first LLM call uses LADDER[1], next [2], next [3], ...
- last rung repeats. When done, status snaps back to LADDER[0]]
+> Start implementation
+[implementation phase begins, first LLM call uses LADDER[1], next [2],
+ next [3], ... last rung repeats. When done, status snaps back to LADDER[0]]
 
 > also add tests for it
 [user follow-up — first LLM call uses LADDER[0] (user-facing), then steps
@@ -214,7 +237,7 @@ Plan ready — what next?
 ```
 
 The status line at the bottom shows the live cursor:
-`▶ exec [2] openai-proxy/gpt-5.5:high (3/5)`.
+`▶ impl [2] openai-proxy/gpt-5.5:high (3/5)`.
 
 ### Commands
 
@@ -222,19 +245,91 @@ The status line at the bottom shows the live cursor:
 |------------------|--------------|
 | `/plan`          | Enter plan mode, restrict to read-only tools, bind provider for the upcoming runs |
 | `/stepdown`      | Print the ladder with the current cursor position |
-| `/stepdown-off`  | Exit plan/execute mode, restore full tools |
+| `/stepdown-off`  | Exit plan/implementation mode, restore full tools |
 
 ### State machine summary
+
+In addition to the stage counter, the extension also supports **one-shot reasoning bumps**
+inside implementing mode: when certain tool results arrive (e.g. failed tools, failing bash,
+or npm/pnpm/yarn/bun output), the *next* LLM call temporarily uses `LADDER[1]` (or `LADDER[0]` if the ladder has
+only one rung). After a bumped turn, the stage cursor continues at the rung *after* the bump (so a bump on `LADDER[1]` continues at `LADDER[2]`).
 
 | Event                                  | Stage transition                              |
 |----------------------------------------|-----------------------------------------------|
 | `/plan`                                | `mode=planning, stage=0`                      |
 | Every LLM call (planning)              | uses `LADDER[0]` regardless of stage          |
-| Plan accepted                          | `mode=executing, stage=1`                     |
-| `turn_end` during executing            | `stage = min(stage+1, LADDER.length-1)`       |
+| Plan accepted                          | `mode=implementing, stage=1`                  |
+| `turn_end` during implementing         | `stage = min(stage+1, LADDER.length-1)`       |
+| `tool_result` trigger (implementing)   | queue bump for next LLM call (resets cursor)  |
 | Aborted turn                           | stage NOT advanced (so /resume picks up here) |
-| `agent_end` during executing           | `stage=0` (reset for next user prompt)        |
+| `agent_end` during implementing        | `stage=0` (reset for next user prompt)        |
 | `/plan` again, or `/stepdown-off`      | reset                                         |
+
+## Native web search (OpenAI Responses)
+
+When using an OpenAI Responses-compatible provider, this extension enables the
+hosted `web_search` tool by default.
+
+- It injects `{ "type": "web_search" }` into the wire payload's `tools`.
+- `search_context_size` follows the current ladder rung via
+  `rung.webSearchContextSize` ("high" → "medium" → "low" as the extension steps
+  down).
+- Search is optional: if `tool_choice` is missing, it's set to `"auto"` so the
+  model decides when to search.
+- Only OpenAI Responses payloads are modified; Chat Completions payloads are
+  left unchanged.
+- The legacy `web_search_preview` tool is not used.
+
+Location bias is enabled by default and sends approximate `country` and `timezone`
+(no city/region). Timezone comes from Node's local `Intl` settings unless
+overridden; country is inferred from common timezones such as
+`Europe/Stockholm` → `SE`, or omitted when unknown.
+
+- Disable location metadata with `PI_OPENAI_WEB_SEARCH_LOCATION=0`.
+- Override country with `PI_OPENAI_WEB_SEARCH_COUNTRY=SE`.
+- Override timezone with `PI_OPENAI_WEB_SEARCH_TIMEZONE=Europe/Stockholm`.
+
+Disable web search globally by setting `PI_OPENAI_WEB_SEARCH=0`.
+Disable per rung by setting `webSearchContextSize: "off"` on that rung.
+
+Caveat: Pi's visible cost/footer and citation rendering may not expose every
+hosted web-search detail. The prompt asks the model to cite important web
+sources explicitly in normal text.
+
+## Prompt caching (OpenAI)
+
+OpenAI automatically caches long prompt prefixes, which can reduce latency and input token costs.
+Cache hits require **exact prefix matches** and typically only apply once prompts exceed ~1024 tokens.
+
+This extension tries to improve cache affinity for OpenAI-compatible backends in a conservative way:
+
+- It keeps pi/provider-provided cache fields if they already exist.
+- If missing, it injects `prompt_cache_key` based on a stable hash of the local username + current working directory (cwd).
+- It optionally requests extended retention via `prompt_cache_retention: "24h"`.
+- **Respects user opt-out**: if the wire payload arrives with both
+  `prompt_cache_key` AND `prompt_cache_retention` undefined, that's pi
+  signalling caching is disabled (e.g. you set `cacheRetention: "none"`
+  in pi settings). The extension passes the payload through untouched
+  rather than re-enabling what you turned off.
+
+### Configuration
+
+In `.pi/extensions/plan-stepdown/index.ts`:
+
+- `OPENAI_PROMPT_CACHE_KEY_PREFIX`: defaults to `"pi-model-staging:"`.
+- `OPENAI_PROMPT_CACHE_RETENTION`: defaults to `"24h"`.
+  - Set it to `undefined` if your proxy rejects the field.
+  - We intentionally do **not** force an explicit in-memory value because different OpenAI SDK versions historically used different spellings (`in_memory` vs `in-memory`).
+
+### Caveats
+
+- Prompt caches are per-organization and per-model/backend. Stepping down across different model IDs (e.g. `gpt-5.5` → `gpt-5.4`) will not share KV cache.
+- If you send >~15 req/min for the same prefix+key, OpenAI may overflow-route and reduce cache effectiveness.
+
+### Monitoring
+
+Check OpenAI usage fields (`cached_tokens`), or in pi watch session stats:
+- `cacheRead` tokens increase on cache hits (for providers that report it).
 
 ## Tests
 
@@ -242,7 +337,7 @@ The status line at the bottom shows the live cursor:
 npm test
 ```
 
-Runs 23 unit tests via Node's built-in test runner with type stripping
+Runs unit tests via Node's built-in test runner with type stripping
 (no extra deps). Coverage:
 
 - API detection: OpenAI Responses / OpenAI Completions / Anthropic adaptive /
@@ -250,10 +345,20 @@ Runs 23 unit tests via Node's built-in test runner with type stripping
 - Payload rewriting per API: model + reasoning swap, no input mutation,
   graceful degradation on unknown payloads
 - `chooseRung` mode/stage dispatch including clamping
-- **End-to-end lifecycle**: simulates a full plan run → accept → exec run
-  with stepping → agent_end reset → user follow-up → second reset, and
-  asserts the exact sequence of model + effort values that hits the wire
-  at every LLM call
+- `nextStage` advancement (called from both normal turn_end and post-bump
+  paths)
+- OpenAI native web-search tool injection, including per-rung
+  `search_context_size`, opt-out, duplicate-tool avoidance, and Chat
+  Completions pass-through
+- OpenAI prompt-cache key/retention augmentation, including the
+  user-opt-out path
+- Reasoning bump trigger detection (failed bash, failed tool calls, package-manager output)
+- **End-to-end lifecycles** (two scenarios):
+  - Plain plan → accept → implement → reset → follow-up, asserting the exact
+    sequence of model + effort values at every LLM call
+  - Bumped path: a `npm test`-style trigger mid-run, asserting the
+    bumped turn uses LADDER[1] and the next normal turn resumes at
+    LADDER[2] (not the pre-bump cursor)
 
 The pure logic lives in [rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts)
 (no pi imports), so tests run without pi or any LLM API keys.
@@ -295,12 +400,13 @@ the plan finishes.
 - Anthropic budget thinking and Google models swap `model` only; the
   thinking budget is left alone. Use adaptive Anthropic models or set
   explicit budgets in your proxy if you need per-turn budget control.
-- The state we persist across `/resume` is `mode + stage`. The state
-  machine resumes correctly but the auto-injected `EXEC_FIRST_PROMPT`
-  fires only once per accept, not on resume.
-- `setModel()` is called only at `/plan`, so re-entering `/plan` after a
-  long executing session will re-bind the provider but pi's display may
-  still lag for a moment until the next turn.
+- The state we persist across `/resume` is `mode + stage`. One-shot bump
+  state is intentionally in-memory only. The state machine resumes correctly
+  but the auto-injected `IMPL_FIRST_PROMPT` fires only once per accept, not
+  on resume.
+- `setModel()` is called only at `/plan` (once per plan→implementation cycle), so
+  pi's own model display lags behind the actual rung in flight. Our
+  status widget shows the truth — see Troubleshooting.
 
 ## How this extension is built
 
@@ -312,8 +418,9 @@ If you want to fork or learn from it:
   — pure functions for API detection and payload rewriting. Zero pi
   imports so it's testable in isolation.
 - [.pi/extensions/plan-stepdown/rewrite.test.ts](.pi/extensions/plan-stepdown/rewrite.test.ts)
-  — 23 unit tests with realistic payload fixtures and full lifecycle
-  simulation.
+  — unit tests with realistic payload fixtures, prompt-cache coverage
+  (including user opt-out), reasoning-bump coverage, and two end-to-end
+  lifecycle simulations (with and without a bump).
 
 The pi APIs used are documented at:
 - [pi extensions guide](https://pi.dev/docs/latest/extensions)
@@ -326,7 +433,7 @@ The pi APIs used are documented at:
 
 The existing upstream
 [plan-mode example](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/examples/extensions/plan-mode)
-is a good reference for the plan/execute UX pattern this extension extends.
+is a good reference for the plan/implementation UX pattern this extension extends.
 
 ## Contributing
 
