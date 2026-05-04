@@ -5,6 +5,8 @@ with a **single configurable model ladder**. The model and reasoning level
 step down as the agent grinds through tool calls "by itself", and snap back
 to the snappy/user-facing tier whenever control returns to you.
 
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## The mental model
 
 One ladder, one counter. The principle: **stepping only happens while the
@@ -13,11 +15,12 @@ user → reset to the top.**
 
 ```ts
 const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high"   }, // [0] snappy / user-facing
-    { modelId: "gpt-5.5",       thinking: "xhigh", webSearchContextSize: "high"   }, // [1] first autonomous step
-    { modelId: "gpt-5.5",       thinking: "high",  webSearchContextSize: "medium" }, // [2]
-    { modelId: "gpt-5.4",       thinking: "high",  webSearchContextSize: "low"    }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high",  webSearchContextSize: "low"    }, // [4]+ (last rung repeats)
+    { modelId: "gpt-5.5:quick", thinking: "xhigh",  webSearchContextSize: "high"   }, // [0] snappy / user-facing
+    { modelId: "gpt-5.4",       thinking: "xhigh",  webSearchContextSize: "high"   }, // [1] first autonomous step
+    { modelId: "gpt-5.4",       thinking: "high",   webSearchContextSize: "medium" }, // [2]
+    { modelId: "gpt-5.4",       thinking: "medium", webSearchContextSize: "medium" }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high",   webSearchContextSize: "low"    }, // [4]
+    { modelId: "gpt-5.2",       thinking: "medium", webSearchContextSize: "low"    }, // [5]+ (last rung repeats)
 ];
 ```
 
@@ -99,17 +102,17 @@ included; see commit history if you want the rationale.
 
 ```bash
 # Global (adds to ~/.pi/agent/settings.json)
-pi install git:github.com/carlhannes/pi-model-staging@v0.1.0
+pi install git:github.com/carlhannes/pi-model-staging@v0.2.0
 
 # Project-local (adds to .pi/settings.json — share with your team)
-pi install -l git:github.com/carlhannes/pi-model-staging@v0.1.0
+pi install -l git:github.com/carlhannes/pi-model-staging@v0.2.0
 
 # Try once without persisting
-pi -e git:github.com/carlhannes/pi-model-staging@v0.1.0
+pi -e git:github.com/carlhannes/pi-model-staging@v0.2.0
 ```
 
 Pi clones the repo, reads the `pi.extensions` field from `package.json`,
-and loads the extension automatically. The `@v0.1.0` pins to a specific
+and loads the extension automatically. The `@v0.2.0` pins to a specific
 release so `pi update` won't surprise you with breaking changes — drop the
 suffix if you want the latest `main`.
 
@@ -151,11 +154,12 @@ and edit the two things near the top:
 const PROVIDER = "openai-proxy";
 
 const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high"   }, // [0] plan + user-facing
-    { modelId: "gpt-5.5",       thinking: "xhigh", webSearchContextSize: "high"   }, // [1] first autonomous step
-    { modelId: "gpt-5.5",       thinking: "high",  webSearchContextSize: "medium" }, // [2]
-    { modelId: "gpt-5.4",       thinking: "high",  webSearchContextSize: "low"    }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high",  webSearchContextSize: "low"    }, // [4]+ (clamps here forever)
+    { modelId: "gpt-5.5:quick", thinking: "xhigh",  webSearchContextSize: "high"   }, // [0] plan + user-facing
+    { modelId: "gpt-5.4",       thinking: "xhigh",  webSearchContextSize: "high"   }, // [1] first autonomous step
+    { modelId: "gpt-5.4",       thinking: "high",   webSearchContextSize: "medium" }, // [2]
+    { modelId: "gpt-5.4",       thinking: "medium", webSearchContextSize: "medium" }, // [3]
+    { modelId: "gpt-5.2",       thinking: "high",   webSearchContextSize: "low"    }, // [4]
+    { modelId: "gpt-5.2",       thinking: "medium", webSearchContextSize: "low"    }, // [5]+ (clamps here forever)
 ];
 ```
 
@@ -237,7 +241,7 @@ Plan ready — what next?
 ```
 
 The status line at the bottom shows the live cursor:
-`▶ impl [2] openai-proxy/gpt-5.5:high (3/5)`.
+`▶ impl [2] openai-proxy/gpt-5.4:high (3/6)`.
 
 ### Commands
 
@@ -323,7 +327,7 @@ In `.pi/extensions/plan-stepdown/index.ts`:
 
 ### Caveats
 
-- Prompt caches are per-organization and per-model/backend. Stepping down across different model IDs (e.g. `gpt-5.5` → `gpt-5.4`) will not share KV cache.
+- Prompt caches are per-organization and per-model/backend. Stepping down across different model IDs (e.g. `gpt-5.4` → `gpt-5.2`) will not share KV cache.
 - If you send >~15 req/min for the same prefix+key, OpenAI may overflow-route and reduce cache effectiveness.
 
 ### Monitoring

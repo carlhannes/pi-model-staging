@@ -11,7 +11,7 @@
  *               - the first turn of any user follow-up prompt during
  *                 implementing (the LLM responding directly to the user)
  *
- *   LADDER[1]   "first autonomous step" (e.g. gpt-5.5 xhigh)
+ *   LADDER[1]   "first autonomous step" (e.g. gpt-5.4 xhigh)
  *               used for the first LLM call after the plan is accepted
  *               (the auto-injected "Please start implementation." run),
  *               and then for turn 2 of each user follow-up.
