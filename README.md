@@ -218,6 +218,8 @@ messages that get injected at the start of plan / implementation phases.
 
 ## Usage
 
+### Interactive
+
 ```
 > /plan
 plan-stepdown: Plan mode ON. Every LLM call uses [0] openai-proxy/gpt-5.5:quick:xhigh
@@ -239,6 +241,16 @@ Plan ready — what next?
 [user follow-up — first LLM call uses LADDER[0] (user-facing), then steps
  down through LADDER[1], LADDER[2], ... again]
 ```
+
+### Headless / non-interactive (opt-in auto-approve)
+
+If you want to skip the plan-approval dialog and automatically start implementation after the plan is produced:
+
+```bash
+pi -p --plan-auto-approve "Refactor the auth module"
+```
+
+**Warning:** `--plan-auto-approve` skips the human-in-the-loop approval step and may modify files.
 
 The status line at the bottom shows the live cursor:
 `▶ impl [2] openai-proxy/gpt-5.4:high (3/6)`.
@@ -393,9 +405,7 @@ The widget needs an interactive TUI. In `pi --print` / `--mode json` /
 `--mode rpc`, the widget is suppressed but the model swaps still happen.
 
 **Plan-ready dialog never appears**
-The dialog is gated on `ctx.hasUI`. In non-interactive modes you'll need
-to flip phases manually with another extension or by re-prompting after
-the plan finishes.
+In non-interactive modes (`pi -p`, `--mode json`) there is no dialog UI. If you want the extension to automatically start implementation after planning, use `--plan-auto-approve`.
 
 ## Limitations
 

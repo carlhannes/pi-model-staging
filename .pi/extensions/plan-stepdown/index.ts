@@ -131,6 +131,7 @@ const REASONING_BUMP: ReasoningBumpConfig = {
 // The rung to bump to. Always ladder[1] (the "first autonomous step" tier),
 // or clamped to the last rung if the ladder is shorter.
 const BUMP_RUNG_INDEX = 1;
+const PLAN_AUTO_APPROVE_FLAG = "plan-auto-approve";
 
 const LADDER: Rung[] = [
 	{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" }, // [0] plan mode (every LLM call)
@@ -213,10 +214,11 @@ analyze the right approach BEFORE any implementation, so don't try to
 work around it. You MAY however utilize bash to execute code and
 verify things while planning to avoid unknown unknowns.
 
-If you're uncertain at any point, STOP and ASK questions!
-State your assumptions clearly. If an assumption turns out to
-be wrong, take a step back, reflect on the root cause, and tell the user
-what caught your eye or wasn't what you expected.
+If you're uncertain, state the uncertainty and your assumptions clearly.
+If a safe conservative assumption is possible, proceed with a plan based
+on that assumption and call it out explicitly. If no safe plan can be made
+without clarification, stop and ask the blocking question clearly instead
+of inventing implementation steps.
 
 # Plan output
 
@@ -239,14 +241,21 @@ of concerns.
 
 # After you present the plan
 
-The user will see a dialog with three choices:
+After the plan is accepted, the extension will switch to implementation
+mode and auto-send "Please start implementation." Edit/write tools will
+then be restored.
 
-* **Start implementation** — the extension auto-sends "Please start
-  implementation." and you switch to implementation mode (with edit/write
-  restored)
-* **Refine — stay in plan mode** — you stay here; the user will give
-  more feedback or clarify things
-* **Cancel — leave plan mode** — drops back to normal pi
+Depending on how pi is running, approval may happen through an interactive
+choice or through an explicit auto-approve flag. Do not assume additional
+human input will be available after the plan.
+
+Possible outcomes after planning:
+
+* **Start implementation** — switch to implementation mode with edit/write
+  tools restored.
+* **Refine — stay in plan mode** — continue planning and incorporate the
+  requested feedback.
+* **Cancel — leave plan mode** — drop back to normal pi.
 
 When revising the plan based on feedback, restate the WHOLE plan so the
 user can track the diff between revisions and the conclusions reached
@@ -254,7 +263,7 @@ during planning.`;
 
 const IMPL_FIRST_PROMPT = `[IMPLEMENTATION MODE]
 
-The user has approved the plan you produced. Edit and write tools are
+The plan you produced has been approved. Edit and write tools are
 available again. Implement the plan you laid out, applying the same
 collaboration principles you used while planning (single source of truth,
 KISS, low-risk/high-impact, DRY, separation of concerns, natural language
@@ -268,8 +277,8 @@ idioms, modify-don't-recreate, no early optimization).
   place; when restructuring, MOVE or COPY first via \`bash\` rather than
   reading and rewriting from scratch.
 * If anything during implementation **contradicts an assumption from the
-  plan**, STOP and ASK the user before continuing — don't quietly
-  rework the plan in your head.
+  plan**, stop and report the contradiction clearly before continuing — don't
+  quietly rework the plan in your head.
 * When creating migrations and similar, utilize a bash tool to confirm
   the correct time and date for the filename when creating the migration file(s).
 
@@ -280,8 +289,8 @@ Before reporting done, do this in order:
 1. **Sanity check** — pick one or a handful of the files you 
    modified (or one of the higher-risk steps) and review it as if you were a colleague
    peer-reviewing the change. Look for mistakes that could come from
-   working in parallel with the user (they may have edited files at the
-   same time).
+   working in parallel with external changes — a human or another process may
+   have edited files at the same time.
 2. **Run linting and type checking** — find the tools in \`package.json\`
    / READMEs / config files. If the codebase has many pre-existing lint
    or type errors, focus only on errors in files you changed.
@@ -294,6 +303,11 @@ Then summarize what changed and report back.`;
 
 export default function planStepdownExtension(pi: ExtensionAPI): void {
 	let mode: Mode = "idle";
+	pi.registerFlag(PLAN_AUTO_APPROVE_FLAG, {
+		description: "Start in plan mode and automatically approve the produced plan",
+		type: "boolean",
+		default: false,
+	});
 	// Single global counter. 0 during planning, set to 1 on accept,
 	// incremented at every turn_end during implementing (clamped to ladder end).
 	let stage = 0;
@@ -434,25 +448,44 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		persist();
 	}
 
+	async function enterPlanMode(ctx: ExtensionContext): Promise<boolean> {
+		mode = "planning";
+		stage = 0;
+		pendingBump = null;
+		activeBump = null;
+		pi.setActiveTools(PLAN_TOOLS);
+		const ok = await bindProviderForRung(LADDER[0], ctx);
+		if (!ok) {
+			reset(ctx);
+			return false;
+		}
+		updateStatus(ctx);
+		persist();
+		ctx.ui.notify(`Plan mode ON. Every LLM call uses ${rungLabel(LADDER[0], 0)}`, "info");
+		return true;
+	}
+
+	function startImplementation(ctx: ExtensionContext): void {
+		mode = "implementing";
+		stage = 1;
+		pendingBump = null;
+		activeBump = null;
+		pi.setActiveTools(IMPL_TOOLS);
+		updateStatus(ctx);
+		persist();
+		pi.sendMessage(
+			{ customType: "plan-stepdown-implement", content: "Please start implementation.", display: true },
+			{ triggerTurn: true },
+		);
+	}
+
 	// -------------------------------------------------------------------------
 	// /plan: enter plan mode, bind PROVIDER + LADDER[0], restrict tools.
 	// -------------------------------------------------------------------------
 	pi.registerCommand("plan", {
 		description: "Enter plan mode — read-only tools, LADDER[0] for every call",
 		handler: async (_args, ctx) => {
-			mode = "planning";
-			stage = 0;
-			pendingBump = null;
-			activeBump = null;
-			pi.setActiveTools(PLAN_TOOLS);
-			const ok = await bindProviderForRung(LADDER[0], ctx);
-			if (!ok) {
-				reset(ctx);
-				return;
-			}
-			updateStatus(ctx);
-			persist();
-			ctx.ui.notify(`Plan mode ON. Every LLM call uses ${rungLabel(LADDER[0], 0)}`, "info");
+			await enterPlanMode(ctx);
 		},
 	});
 
@@ -614,6 +647,10 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		}
 
 		if (mode !== "planning") return;
+		if (pi.getFlag(PLAN_AUTO_APPROVE_FLAG) === true) {
+			startImplementation(ctx);
+			return;
+		}
 		if (!ctx.hasUI) return;
 
 		const choice = await ctx.ui.select("Plan ready — what next?", [
@@ -623,17 +660,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		]);
 
 		if (choice === "Start implementation") {
-			mode = "implementing";
-			stage = 1;
-			pendingBump = null;
-			activeBump = null;
-			pi.setActiveTools(IMPL_TOOLS);
-			updateStatus(ctx);
-			persist();
-			pi.sendMessage(
-				{ customType: "plan-stepdown-implement", content: "Please start implementation.", display: true },
-				{ triggerTurn: true },
-			);
+			startImplementation(ctx);
 		} else if (choice === "Cancel — leave plan mode") {
 			reset(ctx);
 		}
@@ -658,6 +685,9 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			activeBump = null;
 			if (mode === "planning") pi.setActiveTools(PLAN_TOOLS);
 			updateStatus(ctx);
+		}
+		if (pi.getFlag(PLAN_AUTO_APPROVE_FLAG) === true && mode === "idle") {
+			await enterPlanMode(ctx);
 		}
 	});
 }
