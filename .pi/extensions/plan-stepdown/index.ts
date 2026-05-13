@@ -52,7 +52,7 @@
  *
  * Commands:
  *   /plan          — enter plan mode, lock to read-only tools
- *   /stepdown      — show the ladder with the cursor
+ *   /stepdown      — show the resolved config and current cursor
  *   /stepdown-off  — leave plan/implementation mode, restore full tools
  */
 
@@ -402,6 +402,46 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		return activeRungIndex();
 	}
 
+	function formatStepdownReport(ctx: ExtensionContext): string {
+		const currentIdx = effectiveRungIndexForStatus();
+		const currentRung = currentIdx >= 0 ? runtimeConfig.ladder[currentIdx] : null;
+		const ladderLines = runtimeConfig.ladder.map((rung, idx) => {
+			const marker = idx === currentIdx ? "→" : " ";
+			const tags: string[] = [];
+			if (idx === 0) tags.push("plan/user-facing");
+			if (idx === 1) tags.push("first autonomous step");
+			if (idx === runtimeConfig.ladder.length - 1) tags.push("last — repeats");
+			if (rung.webSearchContextSize) tags.push(`web=${rung.webSearchContextSize}`);
+			if (!ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId)) tags.push("missing from provider registry");
+			return `${marker} ${rungLabel(rung, idx)}${tags.length > 0 ? ` (${tags.join(", ")})` : ""}`;
+		});
+
+		const lines = [
+			`plan-stepdown: ${mode}`,
+			`provider: ${runtimeConfig.provider}`,
+			`cursor: ${currentRung ? `${rungLabel(currentRung, currentIdx)} (${currentIdx + 1}/${runtimeConfig.ladder.length})` : "none (idle)"}`,
+		];
+
+		if (activeBump) {
+			lines.push(`active bump: [${activeBump.rungIndex}] ${activeBump.reason}`);
+		} else if (pendingBump) {
+			lines.push(`next bump: [${pendingBump.rungIndex}] ${pendingBump.reason}`);
+		}
+
+		lines.push(
+			"",
+			"ladder:",
+			...ladderLines,
+			"",
+			`tools.plan: ${runtimeConfig.tools.plan.join(", ")}`,
+			`tools.implementation: ${runtimeConfig.tools.implementation.join(", ")}`,
+			`openaiPromptCache: keyPrefix=${runtimeConfig.openaiPromptCache.keyPrefix}, retention=${runtimeConfig.openaiPromptCache.retention ?? "off"}`,
+			`openaiWebSearch: enabled=${runtimeConfig.openaiWebSearch.enabled}, locationEnabled=${runtimeConfig.openaiWebSearch.locationEnabled}`,
+		);
+
+		return lines.join("\n");
+	}
+
 	function persist(): void {
 		pi.appendEntry("plan-stepdown-state", { mode, stage });
 	}
@@ -559,26 +599,9 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("stepdown", {
-		description: "Show the plan-stepdown ladder",
+		description: "Show the resolved plan-stepdown config and current cursor",
 		handler: async (_args, ctx) => {
-			if (mode === "idle") {
-				ctx.ui.notify("plan-stepdown: idle. Run /plan to start.", "info");
-				return;
-			}
-			const cur = activeRungIndex();
-			const lines = runtimeConfig.ladder.map((r, i) => {
-				const marker = i === cur ? "→" : "  ";
-				const tag =
-					i === 0
-						? "(plan mode)"
-						: i === 1
-							? "(first call after accept)"
-							: i === runtimeConfig.ladder.length - 1
-								? "(last — repeats)"
-								: "";
-				return `${marker} ${rungLabel(r, i)} ${tag}`.trim();
-			});
-			ctx.ui.notify(`${mode.toUpperCase()} ladder:\n${lines.join("\n")}`, "info");
+			ctx.ui.notify(formatStepdownReport(ctx), "info");
 		},
 	});
 

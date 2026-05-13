@@ -296,8 +296,11 @@ The status line at the bottom shows the live cursor:
 | Command          | What it does |
 |------------------|--------------|
 | `/plan`          | Enter plan mode, restrict to read-only tools, bind provider for the upcoming runs |
-| `/stepdown`      | Print the ladder with the current cursor position |
+| `/stepdown`      | Show the resolved provider/config ladder and current cursor, even when idle |
 | `/stepdown-off`  | Exit plan/implementation mode, restore full tools |
+
+`/stepdown` shows the config loaded for the current Pi session. After editing
+`plan-stepdown.json`, restart Pi or run `/reload` before checking it again.
 
 ### State machine summary
 
