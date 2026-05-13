@@ -41,14 +41,13 @@ export type ResolvedPlanStepdownConfig = {
 };
 
 export const DEFAULT_PLAN_STEPDOWN_CONFIG: ResolvedPlanStepdownConfig = {
-	provider: "openai-proxy",
+	provider: "openai",
 	ladder: [
-		{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" },
+		{ modelId: "gpt-5.5", thinking: "xhigh", webSearchContextSize: "high" },
 		{ modelId: "gpt-5.4", thinking: "xhigh", webSearchContextSize: "high" },
 		{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "medium" },
 		{ modelId: "gpt-5.4", thinking: "medium", webSearchContextSize: "medium" },
-		{ modelId: "gpt-5.2", thinking: "high", webSearchContextSize: "low" },
-		{ modelId: "gpt-5.2", thinking: "medium", webSearchContextSize: "low" },
+		{ modelId: "gpt-5.4-mini", thinking: "xhigh", webSearchContextSize: "low" },
 	],
 	tools: {
 		plan: ["read", "bash", "grep", "find", "ls"],

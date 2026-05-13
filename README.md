@@ -15,12 +15,11 @@ user → reset to the top.**
 
 ```ts
 const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh",  webSearchContextSize: "high"   }, // [0] snappy / user-facing
-    { modelId: "gpt-5.4",       thinking: "xhigh",  webSearchContextSize: "high"   }, // [1] first autonomous step
-    { modelId: "gpt-5.4",       thinking: "high",   webSearchContextSize: "medium" }, // [2]
-    { modelId: "gpt-5.4",       thinking: "medium", webSearchContextSize: "medium" }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high",   webSearchContextSize: "low"    }, // [4]
-    { modelId: "gpt-5.2",       thinking: "medium", webSearchContextSize: "low"    }, // [5]+ (last rung repeats)
+    { modelId: "gpt-5.5",      thinking: "xhigh",  webSearchContextSize: "high"   }, // [0] snappy / user-facing
+    { modelId: "gpt-5.4",      thinking: "xhigh",  webSearchContextSize: "high"   }, // [1] first autonomous step
+    { modelId: "gpt-5.4",      thinking: "high",   webSearchContextSize: "medium" }, // [2]
+    { modelId: "gpt-5.4",      thinking: "medium", webSearchContextSize: "medium" }, // [3]
+    { modelId: "gpt-5.4-mini", thinking: "xhigh",  webSearchContextSize: "low"    }, // [4]+ (last rung repeats)
 ];
 ```
 
@@ -51,7 +50,7 @@ and reuses them for every turn inside one agent run. Calling
 This extension uses two mechanisms together:
 
 1. **`pi.setModel()` once per plan→implementation cycle, at `/plan`.**
-   Because every rung shares `PROVIDER`, that single binding carries the
+   Because every rung shares the configured `provider`, that single binding carries the
    provider, baseUrl, and API key through plan mode, the auto-injected
    "Please start implementation." run, and any user follow-ups in
    implementing mode. We deliberately don't call it again — pi persists
@@ -102,17 +101,17 @@ included; see commit history if you want the rationale.
 
 ```bash
 # Global (adds to ~/.pi/agent/settings.json)
-pi install git:github.com/carlhannes/pi-model-staging@v0.2.0
+pi install git:github.com/carlhannes/pi-model-staging@v0.3.0
 
 # Project-local (adds to .pi/settings.json — share with your team)
-pi install -l git:github.com/carlhannes/pi-model-staging@v0.2.0
+pi install -l git:github.com/carlhannes/pi-model-staging@v0.3.0
 
 # Try once without persisting
-pi -e git:github.com/carlhannes/pi-model-staging@v0.2.0
+pi -e git:github.com/carlhannes/pi-model-staging@v0.3.0
 ```
 
 Pi clones the repo, reads the `pi.extensions` field from `package.json`,
-and loads the extension automatically. The `@v0.2.0` pins to a specific
+and loads the extension automatically. The `@v0.3.0` pins to a specific
 release so `pi update` won't surprise you with breaking changes — drop the
 suffix if you want the latest `main`.
 
@@ -166,12 +165,13 @@ and `tools.implementation` are treated as **replace**, not deep-merge.
 
 ```json
 {
-  "provider": "openai-proxy",
+  "provider": "openai",
   "ladder": [
-    { "modelId": "gpt-5.5:quick", "thinking": "xhigh", "webSearchContextSize": "high" },
+    { "modelId": "gpt-5.5", "thinking": "xhigh", "webSearchContextSize": "high" },
     { "modelId": "gpt-5.4", "thinking": "xhigh", "webSearchContextSize": "high" },
     { "modelId": "gpt-5.4", "thinking": "high", "webSearchContextSize": "medium" },
-    { "modelId": "gpt-5.2", "thinking": "medium", "webSearchContextSize": "low" }
+    { "modelId": "gpt-5.4", "thinking": "medium", "webSearchContextSize": "medium" },
+    { "modelId": "gpt-5.4-mini", "thinking": "xhigh", "webSearchContextSize": "low" }
   ],
   "tools": {
     "plan": ["read", "bash", "grep", "find", "ls"],
@@ -258,7 +258,7 @@ If you want to change those messages, edit `PLAN_PROMPT` and
 
 ```
 > /plan
-plan-stepdown: Plan mode ON. Every LLM call uses [0] openai-proxy/gpt-5.5:quick:xhigh
+plan-stepdown: Plan mode ON. Every LLM call uses [0] openai/gpt-5.5:xhigh
 
 > How should I refactor the auth module?
 [plan produced — every LLM call inside this run uses LADDER[0]]
@@ -289,7 +289,7 @@ pi -p --plan-auto-approve "Refactor the auth module"
 **Warning:** `--plan-auto-approve` skips the human-in-the-loop approval step and may modify files.
 
 The status line at the bottom shows the live cursor:
-`▶ impl [2] openai-proxy/gpt-5.4:high (3/6)`.
+`▶ impl [2] openai/gpt-5.4:high (3/5)`.
 
 ### Commands
 
@@ -380,7 +380,7 @@ In `plan-stepdown.json`:
 
 ### Caveats
 
-- Prompt caches are per-organization and per-model/backend. Stepping down across different model IDs (e.g. `gpt-5.4` → `gpt-5.2`) will not share KV cache.
+- Prompt caches are per-organization and per-model/backend. Stepping down across different model IDs (e.g. `gpt-5.5` → `gpt-5.4-mini`) will not share KV cache.
 - If you send >~15 req/min for the same prefix+key, OpenAI may overflow-route and reduce cache effectiveness.
 
 ### Monitoring
@@ -424,7 +424,7 @@ The pure logic lives in [rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts)
 
 **`plan-stepdown: model X/Y not found`**
 The model ID in your ladder doesn't match what's in `pi --list-models` for
-`PROVIDER`. Fix the typo, or register a custom provider in
+your configured `provider`. Fix the typo, or register a custom provider in
 `~/.pi/agent/models.json`. The extension resets to idle on this error so it
 won't keep firing.
 

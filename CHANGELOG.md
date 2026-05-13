@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.0 - 2026-05-13
+
+### Added
+- Opt-in headless auto-approval: `--plan-auto-approve` starts in plan mode and automatically transitions to implementation after planning.
+- Per-user and per-project stepdown configuration via JSON:
+  - `~/.pi/agent/plan-stepdown.json` (global)
+  - `.pi/plan-stepdown.json` (project override)
+  - `--stepdown-config <path>` (one-off override)
+- Config parsing/merge tests.
+
+### Changed
+- Default provider is now `openai` with a built-in ladder: `gpt-5.5` → `gpt-5.4` (xhigh/high/medium) → `gpt-5.4-mini`.
+- Documentation updated to prefer JSON configuration over editing the extension source.
+
 ## v0.2.0 - 2026-05-04
 
 ### Added
