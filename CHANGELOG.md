@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.1 - 2026-05-13
+
+### Changed
+- `/stepdown` now shows the resolved provider/config ladder and current cursor even when idle.
+- `/stepdown` now reports the currently loaded session config, including tool lists, prompt-cache settings, web-search settings, and missing provider-registry models.
+- README command/docs updated to describe the always-available `/stepdown` behavior and the `/reload`/restart requirement after config edits.
+
 ## v0.3.0 - 2026-05-13
 
 ### Added

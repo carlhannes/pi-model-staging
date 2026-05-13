@@ -101,17 +101,17 @@ included; see commit history if you want the rationale.
 
 ```bash
 # Global (adds to ~/.pi/agent/settings.json)
-pi install git:github.com/carlhannes/pi-model-staging@v0.3.0
+pi install git:github.com/carlhannes/pi-model-staging@v0.3.1
 
 # Project-local (adds to .pi/settings.json — share with your team)
-pi install -l git:github.com/carlhannes/pi-model-staging@v0.3.0
+pi install -l git:github.com/carlhannes/pi-model-staging@v0.3.1
 
 # Try once without persisting
-pi -e git:github.com/carlhannes/pi-model-staging@v0.3.0
+pi -e git:github.com/carlhannes/pi-model-staging@v0.3.1
 ```
 
 Pi clones the repo, reads the `pi.extensions` field from `package.json`,
-and loads the extension automatically. The `@v0.3.0` pins to a specific
+and loads the extension automatically. The `@v0.3.1` pins to a specific
 release so `pi update` won't surprise you with breaking changes — drop the
 suffix if you want the latest `main`.
 
