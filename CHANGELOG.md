@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.2 - 2026-05-13
+
+### Changed
+- README install docs now lead with the published npm package (`pi install npm:pi-model-staging`) instead of GitHub tag installs.
+- Added package management guidance for `pi list`, `pi update`, `pi remove`, and `pi config`.
+- Added migration guidance for users switching from older git/local installs to the npm package to avoid duplicate commands.
+- Kept GitHub tag installs and local clone/symlink workflows documented as alternatives for source-based usage and development.
+
 ## v0.3.1 - 2026-05-13
 
 ### Changed

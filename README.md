@@ -97,23 +97,25 @@ included; see commit history if you want the rationale.
 
 ## Install
 
-**Official install — pinned to the latest release tag:**
+**Official install — npm package (recommended):**
 
 ```bash
 # Global (adds to ~/.pi/agent/settings.json)
-pi install git:github.com/carlhannes/pi-model-staging@v0.3.1
+pi install npm:pi-model-staging
+
+# Global, pinned to a specific release
+pi install npm:pi-model-staging@0.3.2
 
 # Project-local (adds to .pi/settings.json — share with your team)
-pi install -l git:github.com/carlhannes/pi-model-staging@v0.3.1
+pi install -l npm:pi-model-staging@0.3.2
 
 # Try once without persisting
-pi -e git:github.com/carlhannes/pi-model-staging@v0.3.1
+pi -e npm:pi-model-staging@0.3.2
 ```
 
-Pi clones the repo, reads the `pi.extensions` field from `package.json`,
-and loads the extension automatically. The `@v0.3.1` pins to a specific
-release so `pi update` won't surprise you with breaking changes — drop the
-suffix if you want the latest `main`.
+`pi install` reads the `pi.extensions` field from `package.json` and loads the
+extension automatically. Unpinned npm installs follow the latest published
+release; versioned installs are pinned and skipped by `pi update`.
 
 After install, configure the extension with JSON instead of editing the
 source code directly — see [Configuration](#configuration).
@@ -126,11 +128,46 @@ If you want to hack on the extension itself, clone the repo and edit the
 TypeScript source. For normal per-user or per-project setup, prefer the
 JSON config files.
 
+### Manage install
+
+```bash
+pi list
+pi update npm:pi-model-staging
+pi remove npm:pi-model-staging
+pi config
+```
+
+### Switching from an older git/local install
+
+If you previously installed `plan-stepdown` from a git source or local path,
+remove the old source first to avoid duplicate commands:
+
+```bash
+pi list
+pi remove <old-source-from-pi-list>
+pi install npm:pi-model-staging@0.3.2
+```
+
 ### Verify install
 
 Inside `pi`, run `/help` and you should see `/plan`, `/stepdown`, and
 `/stepdown-off`. If they're missing, check `pi --debug` startup logs for
 extension load errors.
+
+### Alternative: GitHub tag/source install
+
+```bash
+# Global (adds to ~/.pi/agent/settings.json)
+pi install git:github.com/carlhannes/pi-model-staging@v0.3.2
+
+# Project-local (adds to .pi/settings.json — share with your team)
+pi install -l git:github.com/carlhannes/pi-model-staging@v0.3.2
+
+# Try once without persisting
+pi -e git:github.com/carlhannes/pi-model-staging@v0.3.2
+```
+
+Use this if you prefer to install from a Git tag/source instead of npm.
 
 ### Alternative: from a local clone (recommended for developing the extension itself)
 
@@ -141,7 +178,7 @@ cd pi-model-staging
 pi   # auto-discovers .pi/extensions/ when run from the project root
 ```
 
-### Alternative: symlink for global use
+### Alternative: symlink for global development use
 
 ```bash
 git clone https://github.com/carlhannes/pi-model-staging
