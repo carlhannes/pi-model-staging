@@ -73,7 +73,7 @@ to reference a model on a different provider would still send the request
 to the original endpoint with the original key — wrong destination, likely
 wrong wire format too.
 
-In practice: change the `PROVIDER` constant once, then pick freely from the
+In practice: set the `provider` once (in `plan-stepdown.json`), then pick freely from the
 models that provider exposes. If your provider is your own proxy (the
 intended use case), you can use the model name to route to different
 backend tiers — see [models.example.json](models.example.json) for the
@@ -116,11 +116,16 @@ and loads the extension automatically. The `@v0.2.0` pins to a specific
 release so `pi update` won't surprise you with breaking changes — drop the
 suffix if you want the latest `main`.
 
-After install you'll need to edit the ladder in `index.ts` for your own
-model setup — see [Configuration](#configuration). The simplest way to do
-that is to clone and run from a checkout (next section), or to copy
-`.pi/extensions/plan-stepdown/index.ts` into your own project's
-`.pi/extensions/` directory and edit it there.
+After install, configure the extension with JSON instead of editing the
+source code directly — see [Configuration](#configuration).
+
+Configuration files are loaded from:
+- `~/.pi/agent/plan-stepdown.json` (global/user)
+- `.pi/plan-stepdown.json` (project, overrides global)
+
+If you want to hack on the extension itself, clone the repo and edit the
+TypeScript source. For normal per-user or per-project setup, prefer the
+JSON config files.
 
 ### Verify install
 
@@ -128,12 +133,12 @@ Inside `pi`, run `/help` and you should see `/plan`, `/stepdown`, and
 `/stepdown-off`. If they're missing, check `pi --debug` startup logs for
 extension load errors.
 
-### Alternative: from a local clone (recommended for editing the ladder)
+### Alternative: from a local clone (recommended for developing the extension itself)
 
 ```bash
 git clone https://github.com/carlhannes/pi-model-staging
 cd pi-model-staging
-# Edit PROVIDER + LADDER in .pi/extensions/plan-stepdown/index.ts
+# Edit the extension source in .pi/extensions/plan-stepdown/
 pi   # auto-discovers .pi/extensions/ when run from the project root
 ```
 
@@ -147,36 +152,86 @@ ln -s "$(pwd)/pi-model-staging/.pi/extensions/plan-stepdown" \
 
 ## Configuration
 
-Open [.pi/extensions/plan-stepdown/index.ts](.pi/extensions/plan-stepdown/index.ts)
-and edit the two things near the top:
+`plan-stepdown` uses its own JSON config files, merged in this order:
 
-```ts
-const PROVIDER = "openai-proxy";
+1. built-in defaults in the extension
+2. `~/.pi/agent/plan-stepdown.json` (global/user)
+3. `.pi/plan-stepdown.json` (project)
+4. `--stepdown-config /path/to/file.json` (one-off override)
 
-const LADDER: Rung[] = [
-    { modelId: "gpt-5.5:quick", thinking: "xhigh",  webSearchContextSize: "high"   }, // [0] plan + user-facing
-    { modelId: "gpt-5.4",       thinking: "xhigh",  webSearchContextSize: "high"   }, // [1] first autonomous step
-    { modelId: "gpt-5.4",       thinking: "high",   webSearchContextSize: "medium" }, // [2]
-    { modelId: "gpt-5.4",       thinking: "medium", webSearchContextSize: "medium" }, // [3]
-    { modelId: "gpt-5.2",       thinking: "high",   webSearchContextSize: "low"    }, // [4]
-    { modelId: "gpt-5.2",       thinking: "medium", webSearchContextSize: "low"    }, // [5]+ (clamps here forever)
-];
+Project config overrides global config. Arrays such as `ladder`, `tools.plan`,
+and `tools.implementation` are treated as **replace**, not deep-merge.
+
+### Example config
+
+```json
+{
+  "provider": "openai-proxy",
+  "ladder": [
+    { "modelId": "gpt-5.5:quick", "thinking": "xhigh", "webSearchContextSize": "high" },
+    { "modelId": "gpt-5.4", "thinking": "xhigh", "webSearchContextSize": "high" },
+    { "modelId": "gpt-5.4", "thinking": "high", "webSearchContextSize": "medium" },
+    { "modelId": "gpt-5.2", "thinking": "medium", "webSearchContextSize": "low" }
+  ],
+  "tools": {
+    "plan": ["read", "bash", "grep", "find", "ls"],
+    "implementation": ["read", "bash", "edit", "write", "grep", "find", "ls"]
+  },
+  "reasoningBump": {
+    "bumpOnFailedBash": true,
+    "bumpOnFailedTool": true,
+    "bumpOnPackageManagerCommand": true,
+    "packageManagerCommands": ["npm", "pnpm", "yarn", "bun"]
+  },
+  "openaiPromptCache": {
+    "keyPrefix": "pi-model-staging:",
+    "retention": "24h"
+  },
+  "openaiWebSearch": {
+    "enabled": true,
+    "locationEnabled": true
+  }
+}
 ```
 
 ### Field reference
 
-**`PROVIDER`** — string. Must match a provider known to pi
+**`provider`** — string. Must match a provider known to pi
 (`pi --list-models` shows them, including custom ones from
 `~/.pi/agent/models.json`). All rungs use this provider.
 
-**`Rung`**
-- `modelId` — string. Must match a model ID for `PROVIDER`.
+**`ladder`** — array of rungs.
+- `modelId` — string. Must match a model ID for `provider`.
 - `thinking` — `"minimal" | "low" | "medium" | "high" | "xhigh"`.
   Auto-clamped to model capabilities (e.g. setting `xhigh` on a model that
   only supports `high` will silently drop to `high`).
 - `webSearchContextSize` — optional. `"low" | "medium" | "high" | "off"`.
   Controls OpenAI Responses native `web_search` tool context size for this rung.
   Use `"off"` to disable hosted search on a specific rung.
+
+**`tools.plan` / `tools.implementation`** — arrays of tool names. These
+replace the built-in defaults for each phase.
+
+**`reasoningBump`** — controls which tool results temporarily reset the
+next LLM call to the stronger autonomous rung.
+
+**`openaiPromptCache`**
+- `keyPrefix` — string prefix for the generated prompt-cache key.
+- `retention` — `"24h"`, `"in_memory"`, or `null`.
+  Use `null` to omit the retention field.
+
+**`openaiWebSearch`**
+- `enabled` — enable/disable OpenAI Responses hosted web search by default.
+- `locationEnabled` — enable/disable approximate country/timezone metadata by default.
+
+### One-off override file
+
+For CI, experiments, or temporary project-specific routing, you can point
+at another config file without changing your normal user/project config:
+
+```bash
+pi --stepdown-config ./ops/stepdown-ci.json
+```
 
 ### Model and provider names
 
@@ -191,30 +246,11 @@ GPT-5.x model IDs (including `gpt-5.5:quick` for routing to a priority
 tier). Copy into `~/.pi/agent/models.json` (or merge into your existing
 file's `providers` map) and edit `baseUrl` / `apiKey` to match your setup.
 
-### Tools allowed in plan vs implementation
-
-Edit `PLAN_TOOLS` / `IMPL_TOOLS` in `index.ts` if the defaults don't match
-your tool set. Default plan-mode tools are read-only: `read`, `bash`,
-`grep`, `find`, `ls`. Default implementation tools add `edit` and `write`.
-
-### Reasoning bump triggers
-
-Edit `REASONING_BUMP` in `index.ts` to change which tool results restart the
-autonomous cursor from `LADDER[1]` (or `LADDER[0]` for a one-rung ladder).
-Defaults:
-
-- failed bash commands (`isError: true`, including non-zero exit codes and timeouts)
-- failed non-bash tools (`isError: true`, e.g. `edit` exact-match failures)
-- bash commands that start with `npm`, `pnpm`, `yarn`, or `bun`
-
-After the bumped turn completes, normal stepping resumes at the rung after the
-bump. With the default ladder that means `[1]` for the bumped turn, then `[2]`,
-then `[3]`, and so on.
-
 ### System-prompt nudges
 
-Edit `PLAN_PROMPT` and `IMPL_FIRST_PROMPT` in `index.ts` to change the
-messages that get injected at the start of plan / implementation phases.
+The plan/implementation prompts are still part of the extension source.
+If you want to change those messages, edit `PLAN_PROMPT` and
+`IMPL_FIRST_PROMPT` in `.pi/extensions/plan-stepdown/index.ts`.
 
 ## Usage
 
@@ -301,12 +337,17 @@ Location bias is enabled by default and sends approximate `country` and `timezon
 overridden; country is inferred from common timezones such as
 `Europe/Stockholm` → `SE`, or omitted when unknown.
 
-- Disable location metadata with `PI_OPENAI_WEB_SEARCH_LOCATION=0`.
+Defaults come from `openaiWebSearch.enabled` and `openaiWebSearch.locationEnabled`
+in `plan-stepdown.json`.
+
+- Disable location metadata in config with `"openaiWebSearch": { "locationEnabled": false }`.
+- Disable hosted search in config with `"openaiWebSearch": { "enabled": false }`.
+- Disable location metadata via env with `PI_OPENAI_WEB_SEARCH_LOCATION=0`.
 - Override country with `PI_OPENAI_WEB_SEARCH_COUNTRY=SE`.
 - Override timezone with `PI_OPENAI_WEB_SEARCH_TIMEZONE=Europe/Stockholm`.
 
-Disable web search globally by setting `PI_OPENAI_WEB_SEARCH=0`.
-Disable per rung by setting `webSearchContextSize: "off"` on that rung.
+Env vars win for one-off runs. Disable web search globally via env with
+`PI_OPENAI_WEB_SEARCH=0`, or disable it per rung with `webSearchContextSize: "off"`.
 
 Caveat: Pi's visible cost/footer and citation rendering may not expose every
 hosted web-search detail. The prompt asks the model to cite important web
@@ -330,11 +371,11 @@ This extension tries to improve cache affinity for OpenAI-compatible backends in
 
 ### Configuration
 
-In `.pi/extensions/plan-stepdown/index.ts`:
+In `plan-stepdown.json`:
 
-- `OPENAI_PROMPT_CACHE_KEY_PREFIX`: defaults to `"pi-model-staging:"`.
-- `OPENAI_PROMPT_CACHE_RETENTION`: defaults to `"24h"`.
-  - Set it to `undefined` if your proxy rejects the field.
+- `openaiPromptCache.keyPrefix`: defaults to `"pi-model-staging:"`.
+- `openaiPromptCache.retention`: defaults to `"24h"`.
+  - Set it to `null` if your proxy rejects the field or you want to omit it.
   - We intentionally do **not** force an explicit in-memory value because different OpenAI SDK versions historically used different spellings (`in_memory` vs `in-memory`).
 
 ### Caveats

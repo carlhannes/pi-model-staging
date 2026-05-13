@@ -32,7 +32,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test --experimental-strip-types --no-warnings .pi/extensions/plan-stepdown/rewrite.test.ts"
+    "test": "node --test --experimental-strip-types --no-warnings .pi/extensions/plan-stepdown/rewrite.test.ts .pi/extensions/plan-stepdown/config.test.ts"
   },
   "engines": {
     "node": ">=22"

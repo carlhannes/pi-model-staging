@@ -56,7 +56,9 @@
  *   /stepdown-off  — leave plan/implementation mode, restore full tools
  */
 
-import { userInfo } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir, userInfo } from "node:os";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
 	applyOpenAIWebSearchToPayload,
@@ -68,10 +70,14 @@ import {
 	nextStage,
 	type Mode,
 	type OpenAIWebSearchUserLocation,
-	type PromptCacheRetention,
-	type ReasoningBumpConfig,
 	type Rung,
 } from "./rewrite.js";
+import {
+	DEFAULT_PLAN_STEPDOWN_CONFIG,
+	mergePlanStepdownConfig,
+	parsePlanStepdownConfig,
+	type ResolvedPlanStepdownConfig,
+} from "./config.js";
 
 // ---------------------------------------------------------------------------
 // Configure here. Edit freely.
@@ -81,19 +87,11 @@ import {
 // a matching openai-responses-compatible proxy config.
 // ---------------------------------------------------------------------------
 
-const PROVIDER = "openai-proxy";
+const PLAN_AUTO_APPROVE_FLAG = "plan-auto-approve";
+const STEP_DOWN_CONFIG_FLAG = "stepdown-config";
 
-// Conservative OpenAI prompt-cache augmentation.
-// - key: stable hash of local username + cwd, with a project-specific prefix
-//   outside the hash so raw local details are not sent to the provider.
-// - retention: use "24h" for GPT-5.x / gpt-4.1 direct OpenAI-compatible backends,
-//   or set to undefined if your proxy rejects the field.
-// We intentionally OMIT explicit in-memory retention to stay compatible with
-// both older and newer OpenAI SDK/type spellings.
-const OPENAI_PROMPT_CACHE_KEY_PREFIX = "pi-model-staging:";
-const OPENAI_PROMPT_CACHE_RETENTION: PromptCacheRetention | undefined = "24h";
-const OPENAI_WEB_SEARCH_ENABLED = process.env.PI_OPENAI_WEB_SEARCH !== "0";
-const OPENAI_WEB_SEARCH_LOCATION_ENABLED = process.env.PI_OPENAI_WEB_SEARCH_LOCATION !== "0";
+const OPENAI_WEB_SEARCH_ENABLED_ENV = process.env.PI_OPENAI_WEB_SEARCH;
+const OPENAI_WEB_SEARCH_LOCATION_ENABLED_ENV = process.env.PI_OPENAI_WEB_SEARCH_LOCATION;
 
 const TIMEZONE_COUNTRY: Record<string, string> = {
 	"Europe/Stockholm": "SE",
@@ -118,33 +116,99 @@ const TIMEZONE_COUNTRY: Record<string, string> = {
 	"Australia/Sydney": "AU",
 };
 
-// One-shot reasoning bump triggers.
-// When a trigger fires, the *next* LLM call in implementing mode temporarily
-// uses LADDER[BUMP_RUNG_INDEX] (clamped if the ladder is shorter).
-const REASONING_BUMP: ReasoningBumpConfig = {
-	bumpOnFailedBash: true,
-	bumpOnFailedTool: true,
-	bumpOnPackageManagerCommand: true,
-	packageManagerCommands: ["npm", "pnpm", "yarn", "bun"],
-};
+// ---------------------------------------------------------------------------
+// Runtime-loaded configuration.
+//
+// Sources (merged, project takes precedence):
+// - ~/.pi/agent/plan-stepdown.json (global)
+// - <cwd>/.pi/plan-stepdown.json (project)
+//
+// Arrays (ladder, tool lists) are treated as replace-not-merge.
+// ---------------------------------------------------------------------------
 
-// The rung to bump to. Always ladder[1] (the "first autonomous step" tier),
-// or clamped to the last rung if the ladder is shorter.
 const BUMP_RUNG_INDEX = 1;
-const PLAN_AUTO_APPROVE_FLAG = "plan-auto-approve";
 
-const LADDER: Rung[] = [
-	{ modelId: "gpt-5.5:quick", thinking: "xhigh", webSearchContextSize: "high" }, // [0] plan mode (every LLM call)
-	{ modelId: "gpt-5.4", thinking: "xhigh", webSearchContextSize: "high" }, // [1] first call after plan accepted
-	{ modelId: "gpt-5.4", thinking: "high", webSearchContextSize: "medium" }, // [2]
-	{ modelId: "gpt-5.4", thinking: "medium", webSearchContextSize: "medium" }, // [3]
-	{ modelId: "gpt-5.2", thinking: "high", webSearchContextSize: "low" }, // [4]
-	{ modelId: "gpt-5.2", thinking: "medium", webSearchContextSize: "low" }, // [5]+ (clamps here forever)
-];
+function expandHomePath(path: string): string {
+	if (path === "~") return homedir();
+	if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+	return path;
+}
 
-// Tools available during planning — read-only.
-const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls"];
-const IMPL_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+function getConfiguredAgentDir(): string {
+	const configured = process.env.PI_CODING_AGENT_DIR;
+	return configured ? expandHomePath(configured) : join(homedir(), ".pi", "agent");
+}
+
+function loadJson(path: string): { found: boolean; value?: unknown; error?: string } {
+	const resolvedPath = expandHomePath(path);
+	if (!existsSync(resolvedPath)) return { found: false };
+	try {
+		return { found: true, value: JSON.parse(readFileSync(resolvedPath, "utf-8")) };
+	} catch (error) {
+		return {
+			found: true,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+function resolveConfig(ctx: ExtensionContext, pi: ExtensionAPI): { config: ResolvedPlanStepdownConfig; warnings: string[] } {
+	const warnings: string[] = [];
+
+	let config = DEFAULT_PLAN_STEPDOWN_CONFIG;
+
+	const globalPath = join(getConfiguredAgentDir(), "plan-stepdown.json");
+	const projectPath = join(ctx.cwd, ".pi", "plan-stepdown.json");
+	const overridePath = pi.getFlag(STEP_DOWN_CONFIG_FLAG);
+
+	const globalJson = loadJson(globalPath);
+	if (globalJson.error) {
+		warnings.push(`${globalPath}: invalid JSON (${globalJson.error})`);
+	} else if (globalJson.found) {
+		const parsed = parsePlanStepdownConfig(globalJson.value, globalPath);
+		warnings.push(...parsed.warnings);
+		config = mergePlanStepdownConfig(config, parsed.config);
+	}
+
+	const projectJson = loadJson(projectPath);
+	if (projectJson.error) {
+		warnings.push(`${projectPath}: invalid JSON (${projectJson.error})`);
+	} else if (projectJson.found) {
+		const parsed = parsePlanStepdownConfig(projectJson.value, projectPath);
+		warnings.push(...parsed.warnings);
+		config = mergePlanStepdownConfig(config, parsed.config);
+	}
+
+	if (typeof overridePath === "string" && overridePath.trim().length > 0) {
+		const resolvedOverridePath = expandHomePath(overridePath);
+		const json = loadJson(resolvedOverridePath);
+		if (json.error) {
+			warnings.push(`${resolvedOverridePath}: invalid JSON (${json.error})`);
+		} else if (!json.found) {
+			warnings.push(`stepdown-config: file not found: ${resolvedOverridePath}`);
+		} else {
+			const parsed = parsePlanStepdownConfig(json.value, resolvedOverridePath);
+			warnings.push(...parsed.warnings);
+			config = mergePlanStepdownConfig(config, parsed.config);
+		}
+	}
+
+	// Respect env vars as a last-mile operational override.
+	if (OPENAI_WEB_SEARCH_ENABLED_ENV !== undefined || OPENAI_WEB_SEARCH_LOCATION_ENABLED_ENV !== undefined) {
+		config = mergePlanStepdownConfig(config, {
+			openaiWebSearch: {
+				...(OPENAI_WEB_SEARCH_ENABLED_ENV !== undefined
+					? { enabled: OPENAI_WEB_SEARCH_ENABLED_ENV !== "0" }
+					: {}),
+				...(OPENAI_WEB_SEARCH_LOCATION_ENABLED_ENV !== undefined
+					? { locationEnabled: OPENAI_WEB_SEARCH_LOCATION_ENABLED_ENV !== "0" }
+					: {}),
+			},
+		});
+	}
+
+	return { config, warnings };
+}
 
 const PLAN_PROMPT = `[PLAN MODE]
 
@@ -308,6 +372,11 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		type: "boolean",
 		default: false,
 	});
+	pi.registerFlag(STEP_DOWN_CONFIG_FLAG, {
+		description: "Path to a plan-stepdown config JSON file (overrides global/project config)",
+		type: "string",
+	});
+	let runtimeConfig: ResolvedPlanStepdownConfig = DEFAULT_PLAN_STEPDOWN_CONFIG;
 	// Single global counter. 0 during planning, set to 1 on accept,
 	// incremented at every turn_end during implementing (clamped to ladder end).
 	let stage = 0;
@@ -317,13 +386,13 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	let activeBump: { rungIndex: number; reason: string } | null = null;
 
 	function rungLabel(rung: Rung, idx: number): string {
-		return `[${idx}] ${PROVIDER}/${rung.modelId}:${rung.thinking}`;
+		return `[${idx}] ${runtimeConfig.provider}/${rung.modelId}:${rung.thinking}`;
 	}
 
 	function activeRungIndex(): number {
 		if (mode === "idle") return -1;
 		if (mode === "planning") return 0;
-		return Math.min(stage, LADDER.length - 1);
+		return Math.min(stage, runtimeConfig.ladder.length - 1);
 	}
 
 	function effectiveRungIndexForStatus(): number {
@@ -348,7 +417,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	}
 
 	function getPromptCacheKey(ctx: ExtensionContext): string {
-		return createPromptCacheKey(OPENAI_PROMPT_CACHE_KEY_PREFIX, getLocalUsername(), ctx.cwd);
+		return createPromptCacheKey(runtimeConfig.openaiPromptCache.keyPrefix, getLocalUsername(), ctx.cwd);
 	}
 
 	function normalizeCountry(country: string | undefined): string | undefined {
@@ -376,7 +445,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	}
 
 	function getOpenAIWebSearchUserLocation(): OpenAIWebSearchUserLocation | undefined {
-		if (!OPENAI_WEB_SEARCH_LOCATION_ENABLED) return undefined;
+		if (!runtimeConfig.openaiWebSearch.locationEnabled) return undefined;
 		const timezone = normalizeTimezone(process.env.PI_OPENAI_WEB_SEARCH_TIMEZONE) ?? detectSystemTimezone();
 		const country =
 			normalizeCountry(process.env.PI_OPENAI_WEB_SEARCH_COUNTRY) ?? countryFromTimezone(timezone);
@@ -390,7 +459,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		const idx = effectiveRungIndexForStatus();
-		const rung = LADDER[idx];
+		const rung = runtimeConfig.ladder[idx];
 		const color = mode === "planning" ? "warning" : "accent";
 		const icon = mode === "planning" ? "📋 plan" : "▶ impl";
 
@@ -403,7 +472,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			}
 		}
 
-		const label = `${icon} ${rungLabel(rung, idx)} (${idx + 1}/${LADDER.length})${suffix}`;
+		const label = `${icon} ${rungLabel(rung, idx)} (${idx + 1}/${runtimeConfig.ladder.length})${suffix}`;
 		ctx.ui.setStatus("plan-stepdown", ctx.ui.theme.fg(color, label));
 	}
 
@@ -411,17 +480,17 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		// Bind the provider/baseUrl/auth for the upcoming agent run by calling
 		// setModel. The actual per-LLM-call model/effort is overridden again
 		// at before_provider_request, so this just needs to land on a model
-		// hosted by PROVIDER.
-		const model = ctx.modelRegistry.find(PROVIDER, rung.modelId);
+		// hosted by runtimeConfig.provider.
+		const model = ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId);
 		if (!model) {
 			ctx.ui.notify(
-				`plan-stepdown: model ${PROVIDER}/${rung.modelId} not found — fix the ladder or run pi --list-models`,
+				`plan-stepdown: model ${runtimeConfig.provider}/${rung.modelId} not found — fix the ladder or run pi --list-models`,
 				"error",
 			);
 			return false;
 		}
 		if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
-			ctx.ui.notify(`plan-stepdown: no API key configured for ${PROVIDER}`, "error");
+			ctx.ui.notify(`plan-stepdown: no API key configured for ${runtimeConfig.provider}`, "error");
 			return false;
 		}
 		try {
@@ -443,7 +512,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		stage = 0;
 		pendingBump = null;
 		activeBump = null;
-		pi.setActiveTools(IMPL_TOOLS);
+		pi.setActiveTools(runtimeConfig.tools.implementation);
 		updateStatus(ctx);
 		persist();
 	}
@@ -453,15 +522,15 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		stage = 0;
 		pendingBump = null;
 		activeBump = null;
-		pi.setActiveTools(PLAN_TOOLS);
-		const ok = await bindProviderForRung(LADDER[0], ctx);
+		pi.setActiveTools(runtimeConfig.tools.plan);
+		const ok = await bindProviderForRung(runtimeConfig.ladder[0], ctx);
 		if (!ok) {
 			reset(ctx);
 			return false;
 		}
 		updateStatus(ctx);
 		persist();
-		ctx.ui.notify(`Plan mode ON. Every LLM call uses ${rungLabel(LADDER[0], 0)}`, "info");
+		ctx.ui.notify(`Plan mode ON. Every LLM call uses ${rungLabel(runtimeConfig.ladder[0], 0)}`, "info");
 		return true;
 	}
 
@@ -470,7 +539,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		stage = 1;
 		pendingBump = null;
 		activeBump = null;
-		pi.setActiveTools(IMPL_TOOLS);
+		pi.setActiveTools(runtimeConfig.tools.implementation);
 		updateStatus(ctx);
 		persist();
 		pi.sendMessage(
@@ -497,14 +566,14 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			const cur = activeRungIndex();
-			const lines = LADDER.map((r, i) => {
+			const lines = runtimeConfig.ladder.map((r, i) => {
 				const marker = i === cur ? "→" : "  ";
 				const tag =
 					i === 0
 						? "(plan mode)"
 						: i === 1
 							? "(first call after accept)"
-							: i === LADDER.length - 1
+							: i === runtimeConfig.ladder.length - 1
 								? "(last — repeats)"
 								: "";
 				return `${marker} ${rungLabel(r, i)} ${tag}`.trim();
@@ -560,12 +629,12 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 		const reason = detectReasoningBump(
 			{ toolName: event.toolName, input: event.input, isError: event.isError },
-			REASONING_BUMP,
+			runtimeConfig.reasoningBump,
 		);
 		if (!reason) return;
 
-		if (LADDER.length === 0) return;
-		const bumpIndex = Math.min(BUMP_RUNG_INDEX, LADDER.length - 1);
+		if (runtimeConfig.ladder.length === 0) return;
+		const bumpIndex = Math.min(BUMP_RUNG_INDEX, runtimeConfig.ladder.length - 1);
 
 		pendingBump = { rungIndex: bumpIndex, reason };
 		updateStatus(ctx);
@@ -577,13 +646,13 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// rewritten payload replaces what gets sent.
 	// -------------------------------------------------------------------------
 	pi.on("before_provider_request", (event, ctx) => {
-		const rung = activeBump ? LADDER[activeBump.rungIndex] : chooseRung(mode, stage, LADDER);
+		const rung = activeBump ? runtimeConfig.ladder[activeBump.rungIndex] : chooseRung(mode, stage, runtimeConfig.ladder);
 		if (!rung) return;
 
 		let payload = applyRungToPayload(event.payload, rung);
-		const model = ctx.modelRegistry.find(PROVIDER, rung.modelId);
+		const model = ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId);
 
-		const webSearchEnabled = OPENAI_WEB_SEARCH_ENABLED && model?.api === "openai-responses";
+		const webSearchEnabled = runtimeConfig.openaiWebSearch.enabled && model?.api === "openai-responses";
 		payload = applyOpenAIWebSearchToPayload(payload, {
 			enabled: webSearchEnabled,
 			contextSize: rung.webSearchContextSize ?? "low",
@@ -592,9 +661,11 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 		const supportsLongCacheRetention = model?.compat?.supportsLongCacheRetention ?? true;
 		const promptCacheRetention =
-			OPENAI_PROMPT_CACHE_RETENTION === "24h" && !supportsLongCacheRetention
+			runtimeConfig.openaiPromptCache.retention === "24h" && !supportsLongCacheRetention
 				? undefined
-				: OPENAI_PROMPT_CACHE_RETENTION;
+				: runtimeConfig.openaiPromptCache.retention === null
+					? undefined
+					: runtimeConfig.openaiPromptCache.retention;
 
 		payload = applyPromptCacheToPayload(payload, {
 			key: getPromptCacheKey(ctx),
@@ -618,7 +689,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const activeBumpIndex = activeBump?.rungIndex;
 		activeBump = null;
 
-		stage = nextStage(activeBumpIndex ?? stage, LADDER);
+		stage = nextStage(activeBumpIndex ?? stage, runtimeConfig.ladder);
 		updateStatus(ctx);
 		persist();
 	});
@@ -671,6 +742,12 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// session_start: restore mode + stage across resume.
 	// -------------------------------------------------------------------------
 	pi.on("session_start", async (_event, ctx) => {
+		const resolved = resolveConfig(ctx, pi);
+		runtimeConfig = resolved.config;
+		for (const warning of resolved.warnings) {
+			ctx.ui.notify(`plan-stepdown: ${warning}`, "warning");
+		}
+
 		const entries = ctx.sessionManager.getEntries();
 		const last = entries
 			.filter(
@@ -683,7 +760,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			stage = last.data.stage;
 			pendingBump = null;
 			activeBump = null;
-			if (mode === "planning") pi.setActiveTools(PLAN_TOOLS);
+			if (mode === "planning") pi.setActiveTools(runtimeConfig.tools.plan);
+			if (mode === "implementing") pi.setActiveTools(runtimeConfig.tools.implementation);
 			updateStatus(ctx);
 		}
 		if (pi.getFlag(PLAN_AUTO_APPROVE_FLAG) === true && mode === "idle") {
