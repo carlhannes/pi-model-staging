@@ -4,10 +4,10 @@
  * Run with:  node --test --experimental-strip-types .pi/extensions/plan-stepdown/rewrite.test.ts
  *
  * Fixtures mirror real wire payloads from
- *   pi-mono/packages/ai/src/providers/openai-responses.ts (buildParams)
- *   pi-mono/packages/ai/src/providers/openai-completions.ts
- *   pi-mono/packages/ai/src/providers/anthropic.ts (buildParams)
- *   pi-mono/packages/ai/src/providers/google.ts
+ *   pi/packages/ai/src/providers/openai-responses.ts (buildParams)
+ *   pi/packages/ai/src/providers/openai-completions.ts
+ *   pi/packages/ai/src/providers/anthropic.ts (buildParams)
+ *   pi/packages/ai/src/providers/google.ts
  */
 
 import test from "node:test";
@@ -16,6 +16,7 @@ import {
 	applyOpenAIWebSearchToPayload,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
+	chooseContextSafeRungIndex,
 	chooseRung,
 	createPromptCacheKey,
 	detectApi,
@@ -653,6 +654,41 @@ test("chooseRung: implementing past the end clamps to last", () => {
 
 test("chooseRung: implementing with negative stage clamps to first", () => {
 	assert.deepEqual(chooseRung("implementing", -1, LADDER), LADDER[0]);
+});
+
+test("chooseContextSafeRungIndex: keeps base rung when context is unknown", () => {
+	assert.deepEqual(
+		chooseContextSafeRungIndex(2, LADDER, [{ contextWindow: 272000 }, { contextWindow: 272000 }, { contextWindow: 272000 }, { contextWindow: 375000 }], null, 16384),
+		{ index: 2, fallback: false },
+	);
+});
+
+test("chooseContextSafeRungIndex: keeps base rung when it still fits", () => {
+	assert.deepEqual(
+		chooseContextSafeRungIndex(1, LADDER, [{ contextWindow: 272000 }, { contextWindow: 272000 }, { contextWindow: 375000 }, { contextWindow: 375000 }], 120000, 16384),
+		{ index: 1, fallback: false },
+	);
+});
+
+test("chooseContextSafeRungIndex: falls forward to a later larger-context rung", () => {
+	assert.deepEqual(
+		chooseContextSafeRungIndex(1, LADDER, [{ contextWindow: 272000 }, { contextWindow: 272000 }, { contextWindow: 272000 }, { contextWindow: 375000 }], 299081, 16384),
+		{ index: 3, fallback: true },
+	);
+});
+
+test("chooseContextSafeRungIndex: unknown base window does not guess", () => {
+	assert.deepEqual(
+		chooseContextSafeRungIndex(1, LADDER, [{ contextWindow: 272000 }, {}, { contextWindow: 375000 }, { contextWindow: 375000 }], 299081, 16384),
+		{ index: 1, fallback: false },
+	);
+});
+
+test("chooseContextSafeRungIndex: no later rung fits → keep base rung", () => {
+	assert.deepEqual(
+		chooseContextSafeRungIndex(1, LADDER, [{ contextWindow: 272000 }, { contextWindow: 272000 }, { contextWindow: 300000 }, { contextWindow: 310000 }], 299081, 16384),
+		{ index: 1, fallback: false },
+	);
 });
 
 // ============================================================================

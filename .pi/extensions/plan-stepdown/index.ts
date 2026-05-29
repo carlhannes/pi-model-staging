@@ -40,12 +40,12 @@
  *     every single LLM call so the actual model and thinking level match
  *     LADDER[stage]. This is what enables stepping inside one agent run —
  *     pi captures `model` once per run into AgentLoopConfig
- *     (pi-mono/packages/agent/src/agent.ts:413), so we have to rewrite the
+ *     (pi/packages/agent/src/agent.ts:413), so we have to rewrite the
  *     serialized request to step within a run.
  *
  * Same-provider constraint: every rung must be on PROVIDER. The HTTP
  * client is built before before_provider_request runs (e.g.
- * pi-mono/packages/ai/src/providers/anthropic.ts:466), binding baseUrl
+ * pi/packages/ai/src/providers/anthropic.ts:466), binding baseUrl
  * and apiKey to the per-run model. Rewriting the payload to a different
  * provider's model still sends the request to the original endpoint with
  * the wrong key.
@@ -59,25 +59,26 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, userInfo } from "node:os";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	applyOpenAIWebSearchToPayload,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
-	chooseRung,
+	chooseContextSafeRungIndex,
+	chooseRungIndex,
 	createPromptCacheKey,
 	detectReasoningBump,
 	nextStage,
 	type Mode,
 	type OpenAIWebSearchUserLocation,
 	type Rung,
-} from "./rewrite.js";
+} from "./rewrite.ts";
 import {
 	DEFAULT_PLAN_STEPDOWN_CONFIG,
 	mergePlanStepdownConfig,
 	parsePlanStepdownConfig,
 	type ResolvedPlanStepdownConfig,
-} from "./config.js";
+} from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // Configure here. Edit freely.
@@ -127,6 +128,13 @@ const TIMEZONE_COUNTRY: Record<string, string> = {
 // ---------------------------------------------------------------------------
 
 const BUMP_RUNG_INDEX = 1;
+const CONTEXT_FALLBACK_RESERVE_TOKENS = 16384;
+const MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES = 2;
+const IMPLEMENTATION_KICKOFF_CUSTOM_TYPE = "plan-stepdown-implement";
+const IMPLEMENTATION_KICKOFF_MESSAGE = "Please start implementation.";
+const IMPLEMENTATION_CONTINUE_CUSTOM_TYPE = "plan-stepdown-continue";
+const IMPLEMENTATION_CONTINUE_MESSAGE =
+	"Continue from where you left off. If the implementation is complete, summarize what changed and stop.";
 
 function expandHomePath(path: string): string {
 	if (path === "~") return homedir();
@@ -384,6 +392,11 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// One-shot bump state.
 	let pendingBump: { rungIndex: number; reason: string } | null = null;
 	let activeBump: { rungIndex: number; reason: string } | null = null;
+	let activeContextFallback:
+		| { fromIndex: number; toIndex: number; contextTokens: number; contextWindow: number }
+		| null = null;
+	let consecutiveLengthAutoContinues = 0;
+	let autonomousMessageToken = 0;
 
 	function rungLabel(rung: Rung, idx: number): string {
 		return `[${idx}] ${runtimeConfig.provider}/${rung.modelId}:${rung.thinking}`;
@@ -397,6 +410,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 	function effectiveRungIndexForStatus(): number {
 		if (mode === "idle") return -1;
+		if (activeContextFallback) return activeContextFallback.toIndex;
 		if (mode === "planning") return 0;
 		if (activeBump) return activeBump.rungIndex;
 		return activeRungIndex();
@@ -412,7 +426,9 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			if (idx === 1) tags.push("first autonomous step");
 			if (idx === runtimeConfig.ladder.length - 1) tags.push("last — repeats");
 			if (rung.webSearchContextSize) tags.push(`web=${rung.webSearchContextSize}`);
-			if (!ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId)) tags.push("missing from provider registry");
+			const model = ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId);
+			if (!model) tags.push("missing from provider registry");
+			else tags.push(`ctx=${model.contextWindow.toLocaleString()}`);
 			return `${marker} ${rungLabel(rung, idx)}${tags.length > 0 ? ` (${tags.join(", ")})` : ""}`;
 		});
 
@@ -422,10 +438,18 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			`cursor: ${currentRung ? `${rungLabel(currentRung, currentIdx)} (${currentIdx + 1}/${runtimeConfig.ladder.length})` : "none (idle)"}`,
 		];
 
+		if (activeContextFallback) {
+			lines.push(
+				`context fallback: [${activeContextFallback.fromIndex}] → [${activeContextFallback.toIndex}] at ~${activeContextFallback.contextTokens.toLocaleString()}/${activeContextFallback.contextWindow.toLocaleString()} tokens`,
+			);
+		}
 		if (activeBump) {
 			lines.push(`active bump: [${activeBump.rungIndex}] ${activeBump.reason}`);
 		} else if (pendingBump) {
 			lines.push(`next bump: [${pendingBump.rungIndex}] ${pendingBump.reason}`);
+		}
+		if (consecutiveLengthAutoContinues > 0) {
+			lines.push(`length auto-continue: ${consecutiveLengthAutoContinues}/${MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES}`);
 		}
 
 		lines.push(
@@ -493,6 +517,31 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		return { type: "approximate", ...(country ? { country } : {}), ...(timezone ? { timezone } : {}) };
 	}
 
+	function queueAutonomousFollowUp(
+		ctx: ExtensionContext,
+		customType: string,
+		content: string,
+		guard: () => boolean,
+	): void {
+		const message = { customType, content, display: true };
+
+		// During agent_end the run is still active, so queue as a follow-up instead
+		// of trying to trigger a new idle turn. This survives Pi's queued-message
+		// continuation path and also gives overflow compaction recovery a concrete
+		// message to continue with.
+		if (!ctx.isIdle()) {
+			pi.sendMessage(message, { deliverAs: "followUp" });
+			return;
+		}
+
+		const token = ++autonomousMessageToken;
+		setTimeout(() => {
+			if (token !== autonomousMessageToken) return;
+			if (!guard()) return;
+			pi.sendMessage(message, { triggerTurn: true });
+		}, 0);
+	}
+
 	function updateStatus(ctx: ExtensionContext): void {
 		if (mode === "idle") {
 			ctx.ui.setStatus("plan-stepdown", undefined);
@@ -503,15 +552,22 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const color = mode === "planning" ? "warning" : "accent";
 		const icon = mode === "planning" ? "📋 plan" : "▶ impl";
 
-		let suffix = "";
+		const suffixParts: string[] = [];
+		if (activeContextFallback) {
+			suffixParts.push(`ctx→[${activeContextFallback.toIndex}]`);
+		}
 		if (mode === "implementing") {
 			if (activeBump) {
-				suffix = ` ↑ ${activeBump.reason}`;
+				suffixParts.push(`↑ ${activeBump.reason}`);
 			} else if (pendingBump) {
-				suffix = ` next↑ ${pendingBump.reason}`;
+				suffixParts.push(`next↑ ${pendingBump.reason}`);
+			}
+			if (consecutiveLengthAutoContinues > 0) {
+				suffixParts.push(`↻len ${consecutiveLengthAutoContinues}/${MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES}`);
 			}
 		}
 
+		const suffix = suffixParts.length > 0 ? ` ${suffixParts.join(" ")}` : "";
 		const label = `${icon} ${rungLabel(rung, idx)} (${idx + 1}/${runtimeConfig.ladder.length})${suffix}`;
 		ctx.ui.setStatus("plan-stepdown", ctx.ui.theme.fg(color, label));
 	}
@@ -548,20 +604,26 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	}
 
 	function reset(ctx: ExtensionContext): void {
+		autonomousMessageToken++;
 		mode = "idle";
 		stage = 0;
 		pendingBump = null;
 		activeBump = null;
+		activeContextFallback = null;
+		consecutiveLengthAutoContinues = 0;
 		pi.setActiveTools(runtimeConfig.tools.implementation);
 		updateStatus(ctx);
 		persist();
 	}
 
 	async function enterPlanMode(ctx: ExtensionContext): Promise<boolean> {
+		autonomousMessageToken++;
 		mode = "planning";
 		stage = 0;
 		pendingBump = null;
 		activeBump = null;
+		activeContextFallback = null;
+		consecutiveLengthAutoContinues = 0;
 		pi.setActiveTools(runtimeConfig.tools.plan);
 		const ok = await bindProviderForRung(runtimeConfig.ladder[0], ctx);
 		if (!ok) {
@@ -579,13 +641,15 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		stage = 1;
 		pendingBump = null;
 		activeBump = null;
+		activeContextFallback = null;
+		consecutiveLengthAutoContinues = 0;
 		pi.setActiveTools(runtimeConfig.tools.implementation);
 		updateStatus(ctx);
 		persist();
-		pi.sendMessage(
-			{ customType: "plan-stepdown-implement", content: "Please start implementation.", display: true },
-			{ triggerTurn: true },
-		);
+
+		queueAutonomousFollowUp(ctx, IMPLEMENTATION_KICKOFF_CUSTOM_TYPE, IMPLEMENTATION_KICKOFF_MESSAGE, () => {
+			return mode === "implementing" && stage === 1;
+		});
 	}
 
 	// -------------------------------------------------------------------------
@@ -636,8 +700,15 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// turn_start: if a bump is queued, arm it for this turn.
 	// -------------------------------------------------------------------------
 	pi.on("turn_start", async (_event, ctx) => {
-		if (mode !== "implementing") return;
-		if (!pendingBump) return;
+		activeContextFallback = null;
+		if (mode !== "implementing") {
+			updateStatus(ctx);
+			return;
+		}
+		if (!pendingBump) {
+			updateStatus(ctx);
+			return;
+		}
 		activeBump = pendingBump;
 		pendingBump = null;
 		updateStatus(ctx);
@@ -669,12 +740,41 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// rewritten payload replaces what gets sent.
 	// -------------------------------------------------------------------------
 	pi.on("before_provider_request", (event, ctx) => {
-		const rung = activeBump ? runtimeConfig.ladder[activeBump.rungIndex] : chooseRung(mode, stage, runtimeConfig.ladder);
-		if (!rung) return;
+		const preferredIndex = activeBump?.rungIndex ?? chooseRungIndex(mode, stage, runtimeConfig.ladder);
+		if (preferredIndex === null) return;
+
+		const contextUsage = ctx.getContextUsage();
+		const selection = chooseContextSafeRungIndex(
+			preferredIndex,
+			runtimeConfig.ladder,
+			runtimeConfig.ladder.map((candidate) => ({
+				contextWindow: ctx.modelRegistry.find(runtimeConfig.provider, candidate.modelId)?.contextWindow,
+			})),
+			contextUsage?.tokens,
+			CONTEXT_FALLBACK_RESERVE_TOKENS,
+		);
+		if (!selection) return;
+
+		const rung = runtimeConfig.ladder[selection.index];
+		const model = ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId);
+		const nextContextFallback =
+			selection.fallback && contextUsage?.tokens
+				? {
+					fromIndex: preferredIndex,
+					toIndex: selection.index,
+					contextTokens: contextUsage.tokens,
+					contextWindow: model?.contextWindow ?? 0,
+				}
+				: null;
+		const contextFallbackChanged =
+			activeContextFallback?.fromIndex !== nextContextFallback?.fromIndex ||
+			activeContextFallback?.toIndex !== nextContextFallback?.toIndex ||
+			activeContextFallback?.contextTokens !== nextContextFallback?.contextTokens ||
+			activeContextFallback?.contextWindow !== nextContextFallback?.contextWindow;
+		activeContextFallback = nextContextFallback;
+		if (contextFallbackChanged) updateStatus(ctx);
 
 		let payload = applyRungToPayload(event.payload, rung);
-		const model = ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId);
-
 		const webSearchEnabled = runtimeConfig.openaiWebSearch.enabled && model?.api === "openai-responses";
 		payload = applyOpenAIWebSearchToPayload(payload, {
 			enabled: webSearchEnabled,
@@ -706,13 +806,17 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const stop = (event.message as { stopReason?: string } | undefined)?.stopReason;
 		if (stop === "aborted") return;
 
-		// If a bump was active for this turn, advance from the bumped rung
-		// (so a bump on [1] continues at [2]). Otherwise advance from the
+		// If a bump or context fallback was active for this turn, advance from
+		// the rung that actually handled the request. Otherwise advance from the
 		// current stage as normal.
-		const activeBumpIndex = activeBump?.rungIndex;
+		const actualRungIndex = activeContextFallback?.toIndex ?? activeBump?.rungIndex ?? stage;
 		activeBump = null;
+		activeContextFallback = null;
 
-		stage = nextStage(activeBumpIndex ?? stage, runtimeConfig.ladder);
+		stage = nextStage(actualRungIndex, runtimeConfig.ladder);
+		if (stop !== "length") {
+			consecutiveLengthAutoContinues = 0;
+		}
 		updateStatus(ctx);
 		persist();
 	});
@@ -730,11 +834,36 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	//                   facing tier again. Stepping only happens inside one
 	//                   run.
 	// -------------------------------------------------------------------------
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		if (mode === "implementing") {
-			stage = 0;
+			const lastAssistant = [...event.messages]
+				.reverse()
+				.find((message) => message.role === "assistant") as { stopReason?: string } | undefined;
+			const stop = lastAssistant?.stopReason;
+			const shouldAutoContinueLength =
+				stop === "length" &&
+				!ctx.hasPendingMessages() &&
+				consecutiveLengthAutoContinues < MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES;
+
 			pendingBump = null;
 			activeBump = null;
+			activeContextFallback = null;
+
+			if (shouldAutoContinueLength) {
+				consecutiveLengthAutoContinues++;
+				updateStatus(ctx);
+				persist();
+				queueAutonomousFollowUp(
+					ctx,
+					IMPLEMENTATION_CONTINUE_CUSTOM_TYPE,
+					IMPLEMENTATION_CONTINUE_MESSAGE,
+					() => mode === "implementing" && stage > 0,
+				);
+				return;
+			}
+
+			stage = 0;
+			consecutiveLengthAutoContinues = 0;
 			updateStatus(ctx);
 			persist();
 			return;
@@ -783,6 +912,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			stage = last.data.stage;
 			pendingBump = null;
 			activeBump = null;
+			activeContextFallback = null;
+			consecutiveLengthAutoContinues = 0;
 			if (mode === "planning") pi.setActiveTools(runtimeConfig.tools.plan);
 			if (mode === "implementing") pi.setActiveTools(runtimeConfig.tools.implementation);
 			updateStatus(ctx);

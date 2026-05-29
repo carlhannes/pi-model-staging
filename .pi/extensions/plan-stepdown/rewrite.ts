@@ -144,17 +144,71 @@ export function chooseRung(
 	stage: number,
 	ladder: readonly Rung[],
 ): Rung | null {
+	const idx = chooseRungIndex(mode, stage, ladder);
+	return idx === null ? null : ladder[idx];
+}
+
+export function chooseRungIndex(
+	mode: Mode,
+	stage: number,
+	ladder: readonly Rung[],
+): number | null {
 	if (mode === "idle") return null;
 	if (ladder.length === 0) return null;
-	if (mode === "planning") return ladder[0];
-	const idx = Math.max(0, Math.min(stage, ladder.length - 1));
-	return ladder[idx];
+	if (mode === "planning") return 0;
+	return Math.max(0, Math.min(stage, ladder.length - 1));
+}
+
+export type RungContextWindow = {
+	/** Registered model context window for this rung. Missing/invalid means unknown. */
+	contextWindow?: number | null;
+};
+
+export type ContextSafeRungSelection = {
+	index: number;
+	/** True when we had to move to a later rung because the base rung was too small. */
+	fallback: boolean;
+};
+
+/**
+ * Pick the first rung at or after `baseIndex` whose registered context window
+ * can fit the current context plus a reserve. If windows are unknown, or no
+ * later rung fits, keep the base rung. This is deliberately monotonic: context
+ * pressure can step further down the configured ladder, never back up.
+ */
+export function chooseContextSafeRungIndex(
+	baseIndex: number,
+	ladder: readonly Rung[],
+	windows: readonly RungContextWindow[],
+	contextTokens: number | null | undefined,
+	reserveTokens: number,
+): ContextSafeRungSelection | null {
+	if (ladder.length === 0) return null;
+	const clampedBase = Math.max(0, Math.min(baseIndex, ladder.length - 1));
+	if (contextTokens === null || contextTokens === undefined || contextTokens <= 0) {
+		return { index: clampedBase, fallback: false };
+	}
+
+	const required = contextTokens + Math.max(0, reserveTokens);
+	const baseWindow = windows[clampedBase]?.contextWindow;
+	if (typeof baseWindow !== "number" || baseWindow <= 0 || required <= baseWindow) {
+		return { index: clampedBase, fallback: false };
+	}
+
+	for (let index = clampedBase + 1; index < ladder.length; index++) {
+		const contextWindow = windows[index]?.contextWindow;
+		if (typeof contextWindow === "number" && contextWindow > 0 && required <= contextWindow) {
+			return { index, fallback: true };
+		}
+	}
+
+	return { index: clampedBase, fallback: false };
 }
 
 /**
  * Detect the provider API by sniffing distinctive payload fields. The
  * payload is the wire request body about to be sent — see
- * pi-mono/packages/ai/src/providers/*.ts for the exact builders.
+ * pi/packages/ai/src/providers/*.ts for the exact builders.
  */
 export function detectApi(payload: unknown): ApiKind {
 	if (!payload || typeof payload !== "object") return "unknown";
@@ -293,7 +347,7 @@ export function applyPromptCacheToPayload(payload: unknown, options: PromptCache
 	// session id and prompt_cache_retention based on compat config; when both
 	// are undefined here that's pi signalling "caching disabled" (typically
 	// because the user set cacheRetention: "none" in pi settings — see
-	// pi-mono/packages/ai/src/providers/openai-responses.ts:226). Augmenting
+	// pi/packages/ai/src/providers/openai-responses.ts:226). Augmenting
 	// in that case would silently re-enable what the user turned off, so we
 	// pass the payload through untouched.
 	const piDisabledCaching =

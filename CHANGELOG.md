@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Deferred the plan-approval implementation kickoff until after Pi finishes settling the planning `agent_end` event, so choosing "Start implementation" automatically starts work again on current Pi releases.
+- Queued autonomous implementation kickoff/continuation messages through Pi's follow-up path while runs are still active, reducing `Cannot continue from message role: assistant` failures after compaction/retry.
+- Auto-continued capped `stopReason=length` implementation runs so long responses do not silently stall until the user nudges Pi.
+
+### Changed
+- Updated Pi extension imports and documentation references for the `@earendil-works` package/repository namespace.
+- Updated the gitignored local `pi-mono/` reference clone to track `git@github.com:earendil-works/pi.git`.
+- Added context-aware rung fallback so the extension can step forward to a later ladder rung with enough registered context headroom before sending the next provider request.
+- Updated `models.example.json` to match the default ladder, use current `$ENV_VAR` config syntax, and advertise a conservative 375k context window for the larger-context fallback rungs.
+
+### Added
+- Added an entrypoint smoke test so package-scope/import regressions fail under `npm test`.
+
 ## v0.3.2 - 2026-05-13
 
 ### Changed

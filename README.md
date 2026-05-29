@@ -32,6 +32,7 @@ const LADDER: Rung[] = [
 | User follow-up prompt, turn 1 (LLM responding to user, "user-facing")| `LADDER[0]` |
 | Same prompt, turn 2, 3, ... (autonomous tool calls)                  | step down   |
 | Failed tool / bash / npm/pnpm/yarn/bun result during implementing   | bump next call to `LADDER[1]`, then continue at `LADDER[2]` |
+| Implementing run ends with `stopReason=length` and no queued user input | auto-continue (max 2x) from the current autonomous stage |
 | Re-entering `/plan`                                                  | `LADDER[0]` |
 
 So `[0]` covers "user is in control or shaping the plan", `[1]` is "first
@@ -43,11 +44,11 @@ stronger reasoning before stepping down again.
 ## How it actually works
 
 The architectural problem: pi captures `model` and `reasoning` once when it
-builds `AgentLoopConfig` ([agent.ts:413](https://github.com/badlogic/pi-mono/blob/main/packages/agent/src/agent.ts#L413))
+builds `AgentLoopConfig` ([agent.ts:413](https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent.ts#L413))
 and reuses them for every turn inside one agent run. Calling
 `pi.setModel()` mid-loop never reaches the in-flight request.
 
-This extension uses two mechanisms together:
+This extension uses four mechanisms together:
 
 1. **`pi.setModel()` once per plan→implementation cycle, at `/plan`.**
    Because every rung shares the configured `provider`, that single binding carries the
@@ -61,12 +62,23 @@ This extension uses two mechanisms together:
    `reasoning.effort` / `output_config.effort` (depending on API) to
    whatever `LADDER[stage]` says. This is what enables stepping inside one
    agent run.
+3. **Context-safe rung fallback under pressure.** Before each provider request,
+   the extension compares the current estimated context usage against the
+   selected rung's registered `contextWindow`. If that rung is too small, it
+   falls forward to the first later ladder rung with enough room, using a
+   16,384-token reserve to mirror pi's default compaction headroom.
+4. **Autonomous follow-up queueing for kickoff and capped `length` retries.**
+   When plan approval or an implementation `length` stop needs another run, the
+   extension queues a visible custom follow-up message while the current run is
+   still active. That is safer than relying only on an immediate idle
+   `triggerTurn`, and it gives pi's compaction/overflow recovery path a real
+   message to continue with.
 
 ### Same-provider constraint
 
 All rungs must live on the same provider. The HTTP client is built **before**
 `before_provider_request` runs (e.g.
-[anthropic.ts:466](https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/providers/anthropic.ts#L466)),
+[anthropic.ts:466](https://github.com/earendil-works/pi/blob/main/packages/ai/src/providers/anthropic.ts#L466)),
 binding `baseUrl` + `apiKey` from the per-run model. Rewriting the payload
 to reference a model on a different provider would still send the request
 to the original endpoint with the original key — wrong destination, likely
@@ -79,13 +91,13 @@ backend tiers — see [models.example.json](models.example.json) for the
 proxy setup pattern.
 
 If you need true per-turn cross-provider swaps, that requires a small
-upstream patch to pi-mono (`createLoopConfig` → getter style). Not
+upstream patch to pi (`createLoopConfig` → getter style). Not
 included; see commit history if you want the rationale.
 
 ## Requirements
 
 - [pi](https://pi.dev) (any recent version supporting the extension API —
-  tested against pi-mono `main` as of May 2026)
+  tested against pi `main` as of May 2026)
 - Node.js 22+ (only for running the test suite — pi itself bundles its own
   runtime via [jiti](https://github.com/unjs/jiti))
 - A provider with one of the supported APIs:
@@ -151,8 +163,8 @@ pi install npm:pi-model-staging@0.3.2
 ### Verify install
 
 Inside `pi`, run `/help` and you should see `/plan`, `/stepdown`, and
-`/stepdown-off`. If they're missing, check `pi --debug` startup logs for
-extension load errors.
+`/stepdown-off`. If they're missing, restart with `pi --verbose` and check the startup logs for
+extension load errors, or run `/debug` in the interactive TUI.
 
 ### Alternative: GitHub tag/source install
 
@@ -308,7 +320,8 @@ Plan ready — what next?
 
 > Start implementation
 [implementation phase begins, first LLM call uses LADDER[1], next [2],
- next [3], ... last rung repeats. When done, status snaps back to LADDER[0]]
+ next [3], ... last rung repeats. If a run ends with `stopReason=length`,
+ the extension auto-continues up to two times before handing control back.]
 
 > also add tests for it
 [user follow-up — first LLM call uses LADDER[0] (user-facing), then steps
@@ -351,9 +364,11 @@ only one rung). After a bumped turn, the stage cursor continues at the rung *aft
 | `/plan`                                | `mode=planning, stage=0`                      |
 | Every LLM call (planning)              | uses `LADDER[0]` regardless of stage          |
 | Plan accepted                          | `mode=implementing, stage=1`                  |
-| `turn_end` during implementing         | `stage = min(stage+1, LADDER.length-1)`       |
+| `before_provider_request` near limit   | may fall forward to a later rung with enough registered context |
+| `turn_end` during implementing         | `stage = min(actualRung+1, LADDER.length-1)`  |
 | `tool_result` trigger (implementing)   | queue bump for next LLM call (resets cursor)  |
 | Aborted turn                           | stage NOT advanced (so /resume picks up here) |
+| `agent_end` + `stopReason=length`      | keep stage, queue capped auto-continue        |
 | `agent_end` during implementing        | `stage=0` (reset for next user prompt)        |
 | `/plan` again, or `/stepdown-off`      | reset                                         |
 
@@ -442,6 +457,7 @@ Runs unit tests via Node's built-in test runner with type stripping
 - Payload rewriting per API: model + reasoning swap, no input mutation,
   graceful degradation on unknown payloads
 - `chooseRung` mode/stage dispatch including clamping
+- `chooseContextSafeRungIndex` fallback selection using registered context windows
 - `nextStage` advancement (called from both normal turn_end and post-bump
   paths)
 - OpenAI native web-search tool injection, including per-rung
@@ -456,6 +472,8 @@ Runs unit tests via Node's built-in test runner with type stripping
   - Bumped path: a `npm test`-style trigger mid-run, asserting the
     bumped turn uses LADDER[1] and the next normal turn resumes at
     LADDER[2] (not the pre-bump cursor)
+- Extension entrypoint smoke import (`index.ts`) so stale package-scope
+  and local-import regressions fail under `npm test`
 
 The pure logic lives in [rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts)
 (no pi imports), so tests run without pi or any LLM API keys.
@@ -470,7 +488,7 @@ won't keep firing.
 
 **`plan-stepdown: no API key configured for X`**
 Run `pi auth login` for that provider, or set the env var (see
-[pi-mono/packages/ai/src/env-api-keys.ts](https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/env-api-keys.ts)
+[pi's `packages/ai/src/env-api-keys.ts`](https://github.com/earendil-works/pi/blob/main/packages/ai/src/env-api-keys.ts)
 for the var names per provider).
 
 **Pi shows the wrong model in its status display**
@@ -480,6 +498,22 @@ We deliberately call `setModel()` only once at `/plan`. Pi's display reads
 substitutes — our own status widget shows the truth. We avoid calling
 `setModel()` per turn because it persists the new model as the default in
 `settings.json`, which would bounce around constantly.
+
+**Implementation seems to stall near the context limit**
+First check `/stepdown`: it now shows each rung's registered context window
+(`ctx=...`). The extension can only make context-safe fallback decisions from
+what pi's model registry says the models support. If your local
+`~/.pi/agent/models.json` still has older metadata (for example `gpt-5.4-mini`
+at `272000` instead of a conservative `375000`), update that file and restart pi. The
+extension also auto-continues capped `stopReason=length` implementation runs,
+but it will not guess around incorrect provider metadata.
+
+**`Error: Cannot continue from message role: assistant` after compaction**
+The extension now queues autonomous implementation kickoff/continuation work as
+Pi follow-up messages while the current run is still active, which gives pi's
+compaction recovery path an explicit message to continue with. If you still see
+this, the most likely cause is incorrect model metadata or a provider/proxy
+error that pi does not recognize as recoverable overflow.
 
 **Status widget doesn't appear**
 The widget needs an interactive TUI. In `pi --print` / `--mode json` /
@@ -502,6 +536,11 @@ In non-interactive modes (`pi -p`, `--mode json`) there is no dialog UI. If you 
 - `setModel()` is called only at `/plan` (once per plan→implementation cycle), so
   pi's own model display lags behind the actual rung in flight. Our
   status widget shows the truth — see Troubleshooting.
+- Context fallback depends entirely on the registered `contextWindow` values in
+  pi's model registry. If your custom `models.json` lies, the extension will
+  make the wrong fallback decision.
+- `stopReason=length` auto-continuation is intentionally capped at two follow-up
+  runs to avoid open-ended loops.
 
 ## How this extension is built
 
@@ -512,22 +551,26 @@ If you want to fork or learn from it:
 - [.pi/extensions/plan-stepdown/rewrite.ts](.pi/extensions/plan-stepdown/rewrite.ts)
   — pure functions for API detection and payload rewriting. Zero pi
   imports so it's testable in isolation.
+- [.pi/extensions/plan-stepdown/config.test.ts](.pi/extensions/plan-stepdown/config.test.ts)
+  — config parsing and merge coverage for JSON overrides.
 - [.pi/extensions/plan-stepdown/rewrite.test.ts](.pi/extensions/plan-stepdown/rewrite.test.ts)
   — unit tests with realistic payload fixtures, prompt-cache coverage
   (including user opt-out), reasoning-bump coverage, and two end-to-end
   lifecycle simulations (with and without a bump).
+- [.pi/extensions/plan-stepdown/index.test.ts](.pi/extensions/plan-stepdown/index.test.ts)
+  — entrypoint smoke import coverage for package-scope and local-import regressions.
 
 The pi APIs used are documented at:
 - [pi extensions guide](https://pi.dev/docs/latest/extensions)
 - [pi packages guide](https://pi.dev/docs/latest/packages)
-- [extension type definitions](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts)
-- [`before_agent_start` emit site](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L1067)
-- [`before_provider_request` plumbing](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/sdk.ts#L345)
-- [`createLoopConfig`](https://github.com/badlogic/pi-mono/blob/main/packages/agent/src/agent.ts#L410)
+- [extension type definitions](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts)
+- [`before_agent_start` emit site](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/agent-session.ts#L1067)
+- [`before_provider_request` plumbing](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/sdk.ts#L345)
+- [`createLoopConfig`](https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent.ts#L410)
   — explains why per-turn swaps need payload rewriting
 
 The existing upstream
-[plan-mode example](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/examples/extensions/plan-mode)
+[plan-mode example](https://github.com/earendil-works/pi/tree/main/packages/coding-agent/examples/extensions/plan-mode)
 is a good reference for the plan/implementation UX pattern this extension extends.
 
 ## Contributing
@@ -543,7 +586,7 @@ Issues and PRs welcome. The change surface is small:
 If you add support for a new API family, add a fixture and a detection
 test to `rewrite.test.ts`. The fixture should mirror what the corresponding
 provider in
-[pi-mono's `packages/ai/src/providers/`](https://github.com/badlogic/pi-mono/tree/main/packages/ai/src/providers)
+[pi's `packages/ai/src/providers/`](https://github.com/earendil-works/pi/tree/main/packages/ai/src/providers)
 actually sends on the wire.
 
 ## License
@@ -552,4 +595,4 @@ MIT — see [LICENSE](LICENSE).
 
 This extension is independent of pi but builds on its public extension
 API. pi itself is also MIT-licensed
-([badlogic/pi-mono](https://github.com/badlogic/pi-mono)).
+([earendil-works/pi](https://github.com/earendil-works/pi)).

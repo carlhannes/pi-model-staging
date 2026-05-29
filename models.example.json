@@ -3,7 +3,7 @@
     "openai-proxy": {
       "baseUrl": "http://localhost:8088/v1",
       "api": "openai-responses",
-      "apiKey": "OPENAI_API_KEY",
+      "apiKey": "$OPENAI_API_KEY",
       "authHeader": true,
       "models": [
         {
@@ -52,12 +52,27 @@
           }
         },
         {
+          "id": "gpt-5.4-mini",
+          "name": "GPT-5.4 Mini",
+          "reasoning": true,
+          "thinkingLevelMap": { "off": null, "xhigh": "xhigh" },
+          "input": ["text", "image"],
+          "contextWindow": 375000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 0.75,
+            "output": 4.5,
+            "cacheRead": 0.075,
+            "cacheWrite": 0
+          }
+        },
+        {
           "id": "gpt-5.2",
           "name": "GPT-5.2",
           "reasoning": true,
           "thinkingLevelMap": { "off": null, "xhigh": "xhigh" },
           "input": ["text", "image"],
-          "contextWindow": 400000,
+          "contextWindow": 375000,
           "maxTokens": 128000,
           "cost": {
             "input": 1.75,
