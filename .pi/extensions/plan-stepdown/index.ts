@@ -84,7 +84,11 @@ import {
 	parsePlanStepdownConfig,
 	type ResolvedPlanStepdownConfig,
 } from "./config.ts";
-import { buildPlanningToolNames, registerPlanningQuestionTool } from "./questions.ts";
+import {
+	buildPlanningToolNames,
+	formatPlanningQuestionPrompt,
+	registerPlanningQuestionTool,
+} from "./questions.ts";
 
 // ---------------------------------------------------------------------------
 // Configure here. Edit freely.
@@ -379,20 +383,6 @@ Before reporting done, do this in order:
 
 Then summarize what changed and report back.`;
 
-const PLAN_QUESTION_INTERACTIVE_PROMPT = `
-[PLAN MODE: INTERACTIVE CLARIFICATION]
-
-Interactive UI is available, so you may use the \`plan_stepdown_ask_user\` tool for high-level judgement questions that materially affect the plan.
-
-Rules:
-- Use it only for big-picture tradeoffs, architecture choices, or other answers that would change the plan.
-- Do not use it for nitpicky implementation details.
-- Keep each call small: 1-4 questions, with 2-4 options each.
-- Prefer single-choice questions when the user should pick one path, and checkbox-style questions when the answers are independent.
-- Use a custom answer only when none of the listed options fit.
-- If a question does not materially change the plan, make a conservative assumption instead of asking.
-`;
-
 // ---------------------------------------------------------------------------
 
 export default function planStepdownExtension(pi: ExtensionAPI): void {
@@ -546,7 +536,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	}
 
 	function buildPlanPrompt(ctx: ExtensionContext): string {
-		return ctx.hasUI ? `${PLAN_PROMPT}\n\n${PLAN_QUESTION_INTERACTIVE_PROMPT}` : PLAN_PROMPT;
+		return ctx.hasUI ? `${PLAN_PROMPT}\n\n${formatPlanningQuestionPrompt()}` : PLAN_PROMPT;
 	}
 
 	function getLocalUsername(): string {

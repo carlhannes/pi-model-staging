@@ -9,6 +9,28 @@ const MAX_PLANNING_OPTIONS = 4;
 const CUSTOM_ANSWER_LABEL = "Type your own answer";
 const SUBMIT_ANSWERS_LABEL = "Submit selected answers";
 const DEFAULT_CUSTOM_PLACEHOLDER = "Type your own answer";
+const PLANNING_QUESTION_PROMPT_INTRO =
+	`Interactive UI is available, so you may use the \`${PLAN_STEPDOWN_ASK_USER_TOOL_NAME}\` tool for high-level judgement questions that materially affect the plan.`;
+
+export const PLANNING_QUESTION_GUIDELINES = [
+	`Use ${PLAN_STEPDOWN_ASK_USER_TOOL_NAME} only for high-level judgement questions that materially change the plan.`,
+	`Do not use ${PLAN_STEPDOWN_ASK_USER_TOOL_NAME} for nitpicky implementation details.`,
+	`Keep each call small: ${MIN_PLANNING_QUESTIONS}-${MAX_PLANNING_QUESTIONS} questions, with ${MIN_PLANNING_OPTIONS}-${MAX_PLANNING_OPTIONS} options each.`,
+	"Prefer single-choice questions when the user should pick one path, and checkbox-style questions when the answers are independent.",
+	"Use a custom answer only when none of the listed options fit.",
+	"If a question does not materially change the plan, make a conservative assumption instead of asking.",
+] as const;
+
+export function formatPlanningQuestionPrompt(): string {
+	return [
+		"[PLAN MODE: INTERACTIVE CLARIFICATION]",
+		"",
+		PLANNING_QUESTION_PROMPT_INTRO,
+		"",
+		"Rules:",
+		...PLANNING_QUESTION_GUIDELINES.map((guideline) => `- ${guideline}`),
+	].join("\n");
+}
 
 export type PlanningQuestionSpec = {
 	prompt: string;
@@ -137,10 +159,6 @@ function uniqueStrings(values: readonly string[]): string[] {
 	return out;
 }
 
-function formatOptionLabel(option: string): string {
-	return option;
-}
-
 function parseNumberedChoice(choice: string): number | null {
 	const match = /(\d+)\./.exec(choice);
 	if (!match) return null;
@@ -199,7 +217,7 @@ async function askSingleQuestion(
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 ): Promise<PlanningQuestionAnswer | null> {
-	const options = question.options.map((option, index) => `${index + 1}. ${formatOptionLabel(option)}`);
+	const options = question.options.map((option, index) => `${index + 1}. ${option}`);
 	if (question.allowCustom !== false) options.push(CUSTOM_ANSWER_LABEL);
 
 	for (;;) {
@@ -231,7 +249,7 @@ async function askMultiQuestion(
 	for (;;) {
 		const options = question.options.map((option, index) => {
 			const marker = selected.has(index) ? "[x]" : "[ ]";
-			return `${marker} ${index + 1}. ${formatOptionLabel(option)}`;
+			return `${marker} ${index + 1}. ${option}`;
 		});
 		if (question.allowCustom !== false) options.push(CUSTOM_ANSWER_LABEL);
 		options.push(SUBMIT_ANSWERS_LABEL);
@@ -274,12 +292,7 @@ export function registerPlanningQuestionTool(pi: ExtensionAPI): void {
 		label: "Ask planning questions",
 		description: "Ask high-level judgement questions during plan mode and collect structured answers before the final plan.",
 		promptSnippet: "Ask high-level plan questions with options before the final plan.",
-		promptGuidelines: [
-			"Use plan_stepdown_ask_user only for high-level judgement questions that materially change the plan.",
-			"Do not use plan_stepdown_ask_user for nitpicky implementation details.",
-			"Keep each call small: 1-4 questions, with 2-4 options each.",
-			"Use a custom answer only when none of the listed options fit.",
-		],
+		promptGuidelines: [...PLANNING_QUESTION_GUIDELINES],
 		parameters: PLANNING_QUESTION_TOOL_PARAMETERS,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const request = normalizePlanningQuestionRequest(params);
