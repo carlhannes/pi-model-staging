@@ -4,6 +4,7 @@
 
 ### Fixed
 - Deferred the plan-approval implementation kickoff until after Pi finishes settling the planning `agent_end` event, so choosing "Start implementation" automatically starts work again on current Pi releases.
+- Persisted the accepted implementation plan as a branch-local custom session entry and re-injected it on every implementing turn, so compaction no longer has to preserve the exact plan text verbatim.
 - Queued autonomous implementation kickoff/continuation messages through Pi's follow-up path while runs are still active, reducing `Cannot continue from message role: assistant` failures after compaction/retry.
 - Auto-continued capped `stopReason=length` implementation runs so long responses do not silently stall until the user nudges Pi.
 
@@ -12,6 +13,7 @@
 - Updated the gitignored local `pi-mono/` reference clone to track `git@github.com:earendil-works/pi.git`.
 - Added context-aware rung fallback so the extension can step forward to a later ladder rung with enough registered context headroom before sending the next provider request.
 - Updated `models.example.json` to match the default ladder, use current `$ENV_VAR` config syntax, and advertise a conservative 375k context window for the larger-context fallback rungs.
+- Documented the accepted-plan persistence/injection path in the README so compaction behavior and restore semantics are clear.
 
 ### Added
 - Added an entrypoint smoke test so package-scope/import regressions fail under `npm test`.

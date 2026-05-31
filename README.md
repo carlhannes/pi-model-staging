@@ -48,7 +48,7 @@ builds `AgentLoopConfig` ([agent.ts:413](https://github.com/earendil-works/pi/bl
 and reuses them for every turn inside one agent run. Calling
 `pi.setModel()` mid-loop never reaches the in-flight request.
 
-This extension uses four mechanisms together:
+This extension uses five mechanisms together:
 
 1. **`pi.setModel()` once per plan→implementation cycle, at `/plan`.**
    Because every rung shares the configured `provider`, that single binding carries the
@@ -67,7 +67,12 @@ This extension uses four mechanisms together:
    selected rung's registered `contextWindow`. If that rung is too small, it
    falls forward to the first later ladder rung with enough room, using a
    16,384-token reserve to mirror pi's default compaction headroom.
-4. **Autonomous follow-up queueing for kickoff and capped `length` retries.**
+4. **Accepted-plan persistence + per-call context injection.** When a plan is
+   accepted, the exact assistant text is stored once as session state and
+   re-injected into every implementing turn through Pi's `context` hook. That
+   keeps the approved plan available even if compaction rewrites the visible
+   transcript.
+5. **Autonomous follow-up queueing for kickoff and capped `length` retries.**
    When plan approval or an implementation `length` stop needs another run, the
    extension queues a visible custom follow-up message while the current run is
    still active. That is safer than relying only on an immediate idle
@@ -363,7 +368,7 @@ only one rung). After a bumped turn, the stage cursor continues at the rung *aft
 |----------------------------------------|-----------------------------------------------|
 | `/plan`                                | `mode=planning, stage=0`                      |
 | Every LLM call (planning)              | uses `LADDER[0]` regardless of stage          |
-| Plan accepted                          | `mode=implementing, stage=1`                  |
+| Plan accepted                          | `mode=implementing, stage=1`, accepted plan persisted and re-injected |
 | `before_provider_request` near limit   | may fall forward to a later rung with enough registered context |
 | `turn_end` during implementing         | `stage = min(actualRung+1, LADDER.length-1)`  |
 | `tool_result` trigger (implementing)   | queue bump for next LLM call (resets cursor)  |
@@ -507,6 +512,13 @@ what pi's model registry says the models support. If your local
 at `272000` instead of a conservative `375000`), update that file and restart pi. The
 extension also auto-continues capped `stopReason=length` implementation runs,
 but it will not guess around incorrect provider metadata.
+
+**Accepted plan does not seem to survive compaction**
+That plan is stored as a custom session entry and re-injected into implementing
+calls via the `context` hook, not recovered from the compaction summary. If
+`/stepdown` shows `accepted plan: none`, you probably started a fresh plan,
+cleared state with `/stepdown-off`, or accepted the plan before switching into
+implementation mode. Re-accept the plan and start implementation again.
 
 **`Error: Cannot continue from message role: assistant` after compaction**
 The extension now queues autonomous implementation kickoff/continuation work as

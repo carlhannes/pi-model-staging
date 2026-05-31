@@ -68,7 +68,12 @@ import {
 	chooseRungIndex,
 	createPromptCacheKey,
 	detectReasoningBump,
+	extractLatestAssistantText,
+	formatAcceptedPlanContext,
+	hasCustomMessage,
 	nextStage,
+	normalizeAcceptedPlan,
+	type MessageWithRole,
 	type Mode,
 	type OpenAIWebSearchUserLocation,
 	type Rung,
@@ -130,6 +135,8 @@ const TIMEZONE_COUNTRY: Record<string, string> = {
 const BUMP_RUNG_INDEX = 1;
 const CONTEXT_FALLBACK_RESERVE_TOKENS = 16384;
 const MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES = 2;
+const ACCEPTED_PLAN_ENTRY_TYPE = "plan-stepdown-accepted-plan";
+const ACCEPTED_PLAN_CONTEXT_CUSTOM_TYPE = "plan-stepdown-accepted-plan-context";
 const IMPLEMENTATION_KICKOFF_CUSTOM_TYPE = "plan-stepdown-implement";
 const IMPLEMENTATION_KICKOFF_MESSAGE = "Please start implementation.";
 const IMPLEMENTATION_CONTINUE_CUSTOM_TYPE = "plan-stepdown-continue";
@@ -395,6 +402,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	let activeContextFallback:
 		| { fromIndex: number; toIndex: number; contextTokens: number; contextWindow: number }
 		| null = null;
+	let acceptedPlan: string | null = null;
 	let consecutiveLengthAutoContinues = 0;
 	let autonomousMessageToken = 0;
 
@@ -451,6 +459,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (consecutiveLengthAutoContinues > 0) {
 			lines.push(`length auto-continue: ${consecutiveLengthAutoContinues}/${MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES}`);
 		}
+		lines.push(`accepted plan: ${acceptedPlan ? `stored (${acceptedPlan.length.toLocaleString()} chars)` : "none"}`);
 
 		lines.push(
 			"",
@@ -468,6 +477,37 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 	function persist(): void {
 		pi.appendEntry("plan-stepdown-state", { mode, stage });
+	}
+
+	function setAcceptedPlan(plan: string | null | undefined): void {
+		const nextPlan = normalizeAcceptedPlan(plan);
+		if (acceptedPlan === nextPlan) return;
+		acceptedPlan = nextPlan;
+		pi.appendEntry(ACCEPTED_PLAN_ENTRY_TYPE, { plan: nextPlan });
+	}
+
+	function restoreAcceptedPlan(entries: readonly { type: string; customType?: string; data?: { plan?: unknown } }[]): string | null {
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const entry = entries[index];
+			if (entry.type !== "custom" || entry.customType !== ACCEPTED_PLAN_ENTRY_TYPE) continue;
+			return normalizeAcceptedPlan(entry.data?.plan);
+		}
+		return null;
+	}
+
+	function extractAcceptedPlan(messages: readonly MessageWithRole[]): string | null {
+		return extractLatestAssistantText(messages);
+	}
+
+	function buildAcceptedPlanContextMessage(): MessageWithRole | null {
+		if (mode !== "implementing" || !acceptedPlan) return null;
+		return {
+			role: "custom",
+			customType: ACCEPTED_PLAN_CONTEXT_CUSTOM_TYPE,
+			content: formatAcceptedPlanContext(acceptedPlan),
+			display: false,
+			timestamp: Date.now(),
+		};
 	}
 
 	function getLocalUsername(): string {
@@ -610,6 +650,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		pendingBump = null;
 		activeBump = null;
 		activeContextFallback = null;
+		setAcceptedPlan(null);
 		consecutiveLengthAutoContinues = 0;
 		pi.setActiveTools(runtimeConfig.tools.implementation);
 		updateStatus(ctx);
@@ -623,6 +664,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		pendingBump = null;
 		activeBump = null;
 		activeContextFallback = null;
+		setAcceptedPlan(null);
 		consecutiveLengthAutoContinues = 0;
 		pi.setActiveTools(runtimeConfig.tools.plan);
 		const ok = await bindProviderForRung(runtimeConfig.ladder[0], ctx);
@@ -696,6 +738,16 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		}
 	});
 
+	pi.on("context", async (event) => {
+		if (mode !== "implementing" || !acceptedPlan) return;
+		if (hasCustomMessage(event.messages, ACCEPTED_PLAN_CONTEXT_CUSTOM_TYPE)) return;
+		const acceptedPlanMessage = buildAcceptedPlanContextMessage();
+		if (!acceptedPlanMessage) return;
+		return {
+			messages: [acceptedPlanMessage, ...event.messages],
+		};
+	});
+
 	// -------------------------------------------------------------------------
 	// turn_start: if a bump is queued, arm it for this turn.
 	// -------------------------------------------------------------------------
@@ -744,13 +796,17 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (preferredIndex === null) return;
 
 		const contextUsage = ctx.getContextUsage();
+		const acceptedPlanContext = acceptedPlan ? formatAcceptedPlanContext(acceptedPlan) : null;
+		const acceptedPlanTokens = acceptedPlanContext ? Math.ceil(acceptedPlanContext.length / 4) : 0;
 		const selection = chooseContextSafeRungIndex(
 			preferredIndex,
 			runtimeConfig.ladder,
 			runtimeConfig.ladder.map((candidate) => ({
 				contextWindow: ctx.modelRegistry.find(runtimeConfig.provider, candidate.modelId)?.contextWindow,
 			})),
-			contextUsage?.tokens,
+			contextUsage?.tokens === null || contextUsage?.tokens === undefined
+				? contextUsage?.tokens
+				: contextUsage.tokens + acceptedPlanTokens,
 			CONTEXT_FALLBACK_RESERVE_TOKENS,
 		);
 		if (!selection) return;
@@ -871,6 +927,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 		if (mode !== "planning") return;
 		if (pi.getFlag(PLAN_AUTO_APPROVE_FLAG) === true) {
+			setAcceptedPlan(extractAcceptedPlan(event.messages));
 			startImplementation(ctx);
 			return;
 		}
@@ -883,6 +940,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		]);
 
 		if (choice === "Start implementation") {
+			setAcceptedPlan(extractAcceptedPlan(event.messages));
 			startImplementation(ctx);
 		} else if (choice === "Cancel — leave plan mode") {
 			reset(ctx);
@@ -900,13 +958,14 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`plan-stepdown: ${warning}`, "warning");
 		}
 
-		const entries = ctx.sessionManager.getEntries();
-		const last = entries
+		const branchEntries = ctx.sessionManager.getBranch();
+		const last = branchEntries
 			.filter(
 				(e: { type: string; customType?: string }) =>
 					e.type === "custom" && e.customType === "plan-stepdown-state",
 			)
 			.pop() as { data?: { mode: Mode; stage: number } } | undefined;
+		acceptedPlan = restoreAcceptedPlan(branchEntries);
 		if (last?.data) {
 			mode = last.data.mode;
 			stage = last.data.stage;

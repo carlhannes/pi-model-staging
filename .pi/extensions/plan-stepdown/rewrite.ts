@@ -75,6 +75,61 @@ export function createPromptCacheKey(prefix: string, username: string, cwd: stri
 	return `${prefix}${digest}`;
 }
 
+export type MessageWithRole = {
+	role?: string;
+	content?: unknown;
+	customType?: string;
+	timestamp?: number;
+};
+
+export function normalizeAcceptedPlan(plan: string | null | undefined): string | null {
+	if (typeof plan !== "string") return null;
+	const normalized = plan.trim();
+	return normalized.length > 0 ? normalized : null;
+}
+
+export function contentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(block): block is { type: string; text: string } =>
+				typeof block === "object" &&
+				block !== null &&
+				"type" in block &&
+				(block as { type?: unknown }).type === "text" &&
+				"text" in block &&
+				typeof (block as { text?: unknown }).text === "string",
+		)
+		.map((block) => block.text)
+		.join("\n");
+}
+
+export function extractLatestAssistantText(messages: readonly MessageWithRole[]): string | null {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role !== "assistant") continue;
+		const text = normalizeAcceptedPlan(contentText(message.content));
+		if (text) return text;
+	}
+	return null;
+}
+
+export function formatAcceptedPlanContext(plan: string): string {
+	return [
+		"The latest accepted implementation plan is preserved below in exact form.",
+		"Treat it as the approved baseline unless newer user messages explicitly change direction.",
+		"",
+		"<accepted-plan>",
+		plan,
+		"</accepted-plan>",
+	].join("\n");
+}
+
+export function hasCustomMessage(messages: readonly MessageWithRole[], customType: string): boolean {
+	return messages.some((message) => message?.role === "custom" && message.customType === customType);
+}
+
 /**
  * Advance the stage cursor by one, clamped to the last rung. The caller
  * decides what `from` should be — either the current stage (for a normal

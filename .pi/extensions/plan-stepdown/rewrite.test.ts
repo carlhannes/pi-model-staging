@@ -18,10 +18,15 @@ import {
 	applyRungToPayload,
 	chooseContextSafeRungIndex,
 	chooseRung,
+	contentText,
 	createPromptCacheKey,
 	detectApi,
 	detectReasoningBump,
+	extractLatestAssistantText,
+	formatAcceptedPlanContext,
+	hasCustomMessage,
 	nextStage,
+	normalizeAcceptedPlan,
 	startsWithShellCommand,
 	type ReasoningBumpConfig,
 	type Rung,
@@ -93,6 +98,70 @@ test("detectApi: garbage", () => {
 
 // (rungAt was inlined into chooseRung — its clamping behaviour is now
 // covered by the chooseRung tests below.)
+
+// ============================================================================
+// accepted plan helpers
+// ============================================================================
+
+test("normalizeAcceptedPlan: trims and nulls empty plans", () => {
+	assert.equal(normalizeAcceptedPlan("  plan  "), "plan");
+	assert.equal(normalizeAcceptedPlan("\n\t  \n"), null);
+	assert.equal(normalizeAcceptedPlan(undefined), null);
+});
+
+test("contentText: keeps only text blocks from array content", () => {
+	assert.equal(
+		contentText([
+			{ type: "text", text: "Line 1" },
+			{ type: "thinking", thinking: "hidden" },
+			{ type: "text", text: "Line 2" },
+		]),
+		"Line 1\nLine 2",
+	);
+	assert.equal(contentText("plain string"), "plain string");
+	assert.equal(contentText(null), "");
+});
+
+test("extractLatestAssistantText: returns the latest assistant text content", () => {
+	assert.equal(
+		extractLatestAssistantText([
+			{ role: "user", content: "hello" },
+			{ role: "assistant", content: [{ type: "text", text: "First plan" }] },
+			{ role: "assistant", content: [{ type: "text", text: "  Final accepted plan  " }] },
+		]),
+		"Final accepted plan",
+	);
+});
+
+test("extractLatestAssistantText: skips assistants without visible text", () => {
+	assert.equal(
+		extractLatestAssistantText([
+			{ role: "assistant", content: [{ type: "thinking", thinking: "hidden" }] },
+			{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "a.ts" } }] },
+		]),
+		null,
+	);
+});
+
+test("formatAcceptedPlanContext: wraps the exact accepted plan", () => {
+	assert.equal(
+		formatAcceptedPlanContext("Plan:\n1. Do the thing"),
+		[
+			"The latest accepted implementation plan is preserved below in exact form.",
+			"Treat it as the approved baseline unless newer user messages explicitly change direction.",
+			"",
+			"<accepted-plan>",
+			"Plan:\n1. Do the thing",
+			"</accepted-plan>",
+		].join("\n"),
+	);
+});
+
+test("hasCustomMessage: detects matching custom messages only", () => {
+	assert.equal(hasCustomMessage([{ role: "custom", customType: "accepted-plan" }], "accepted-plan"), true);
+	assert.equal(hasCustomMessage([{ role: "custom", customType: "other" }], "accepted-plan"), false);
+	assert.equal(hasCustomMessage([{ role: "assistant" }], "accepted-plan"), false);
+});
 
 // ============================================================================
 // applyRungToPayload — OpenAI Responses
