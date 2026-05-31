@@ -48,7 +48,7 @@ builds `AgentLoopConfig` ([agent.ts:413](https://github.com/earendil-works/pi/bl
 and reuses them for every turn inside one agent run. Calling
 `pi.setModel()` mid-loop never reaches the in-flight request.
 
-This extension uses five mechanisms together:
+This extension uses six mechanisms together:
 
 1. **`pi.setModel()` once per plan→implementation cycle, at `/plan`.**
    Because every rung shares the configured `provider`, that single binding carries the
@@ -67,12 +67,16 @@ This extension uses five mechanisms together:
    selected rung's registered `contextWindow`. If that rung is too small, it
    falls forward to the first later ladder rung with enough room, using a
    16,384-token reserve to mirror pi's default compaction headroom.
-4. **Accepted-plan persistence + per-call context injection.** When a plan is
+4. **Interactive clarification questions when UI is available.** In
+   interactive/RPC sessions, plan mode can expose a small structured question
+   tool for high-level judgement calls. It is extension-managed, not part of
+   `tools.plan`, and it is omitted entirely in headless/no-UI mode.
+5. **Accepted-plan persistence + per-call context injection.** When a plan is
    accepted, the exact assistant text is stored once as session state and
    re-injected into every implementing turn through Pi's `context` hook. That
    keeps the approved plan available even if compaction rewrites the visible
    transcript.
-5. **Autonomous follow-up queueing for kickoff and capped `length` retries.**
+6. **Autonomous follow-up queueing for kickoff and capped `length` retries.**
    When plan approval or an implementation `length` stop needs another run, the
    extension queues a visible custom follow-up message while the current run is
    still active. That is safer than relying only on an immediate idle
@@ -265,6 +269,8 @@ and `tools.implementation` are treated as **replace**, not deep-merge.
 
 **`tools.plan` / `tools.implementation`** — arrays of tool names. These
 replace the built-in defaults for each phase.
+The structured planning-question tool is extension-managed and only appears
+in interactive plan mode; do not add it to `tools.plan`.
 
 **`reasoningBump`** — controls which tool results temporarily reset the
 next LLM call to the stronger autonomous rung.
@@ -332,6 +338,8 @@ Plan ready — what next?
 [user follow-up — first LLM call uses LADDER[0] (user-facing), then steps
  down through LADDER[1], LADDER[2], ... again]
 ```
+
+If the plan needs a big-picture decision, interactive sessions may open a structured question dialog before the final plan. Headless CLI sessions do not get that dialog; plan-stepdown falls back to plain-text clarification or conservative assumptions.
 
 ### Headless / non-interactive (opt-in auto-approve)
 

@@ -32,7 +32,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test --experimental-strip-types --no-warnings .pi/extensions/plan-stepdown/rewrite.test.ts .pi/extensions/plan-stepdown/config.test.ts .pi/extensions/plan-stepdown/index.test.ts"
+    "test": "node --test --experimental-strip-types --no-warnings .pi/extensions/plan-stepdown/rewrite.test.ts .pi/extensions/plan-stepdown/config.test.ts .pi/extensions/plan-stepdown/questions.test.ts .pi/extensions/plan-stepdown/index.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

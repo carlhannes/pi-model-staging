@@ -84,6 +84,7 @@ import {
 	parsePlanStepdownConfig,
 	type ResolvedPlanStepdownConfig,
 } from "./config.ts";
+import { buildPlanningToolNames, registerPlanningQuestionTool } from "./questions.ts";
 
 // ---------------------------------------------------------------------------
 // Configure here. Edit freely.
@@ -378,6 +379,20 @@ Before reporting done, do this in order:
 
 Then summarize what changed and report back.`;
 
+const PLAN_QUESTION_INTERACTIVE_PROMPT = `
+[PLAN MODE: INTERACTIVE CLARIFICATION]
+
+Interactive UI is available, so you may use the \`plan_stepdown_ask_user\` tool for high-level judgement questions that materially affect the plan.
+
+Rules:
+- Use it only for big-picture tradeoffs, architecture choices, or other answers that would change the plan.
+- Do not use it for nitpicky implementation details.
+- Keep each call small: 1-4 questions, with 2-4 options each.
+- Prefer single-choice questions when the user should pick one path, and checkbox-style questions when the answers are independent.
+- Use a custom answer only when none of the listed options fit.
+- If a question does not materially change the plan, make a conservative assumption instead of asking.
+`;
+
 // ---------------------------------------------------------------------------
 
 export default function planStepdownExtension(pi: ExtensionAPI): void {
@@ -405,6 +420,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	let acceptedPlan: string | null = null;
 	let consecutiveLengthAutoContinues = 0;
 	let autonomousMessageToken = 0;
+	let planningQuestionsToolRegistered = false;
 
 	function rungLabel(rung: Rung, idx: number): string {
 		return `[${idx}] ${runtimeConfig.provider}/${rung.modelId}:${rung.thinking}`;
@@ -460,13 +476,15 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			lines.push(`length auto-continue: ${consecutiveLengthAutoContinues}/${MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES}`);
 		}
 		lines.push(`accepted plan: ${acceptedPlan ? `stored (${acceptedPlan.length.toLocaleString()} chars)` : "none"}`);
+		lines.push(`plan questions: ${mode === "planning" && ctx.hasUI ? "interactive" : "inactive"}`);
 
 		lines.push(
 			"",
 			"ladder:",
 			...ladderLines,
 			"",
-			`tools.plan: ${runtimeConfig.tools.plan.join(", ")}`,
+			`tools.plan.base: ${runtimeConfig.tools.plan.join(", ")}`,
+			`tools.plan.effective: ${buildPlanningToolNames(runtimeConfig.tools.plan, mode === "planning" && ctx.hasUI).join(", ")}`,
 			`tools.implementation: ${runtimeConfig.tools.implementation.join(", ")}`,
 			`openaiPromptCache: keyPrefix=${runtimeConfig.openaiPromptCache.keyPrefix}, retention=${runtimeConfig.openaiPromptCache.retention ?? "off"}`,
 			`openaiWebSearch: enabled=${runtimeConfig.openaiWebSearch.enabled}, locationEnabled=${runtimeConfig.openaiWebSearch.locationEnabled}`,
@@ -508,6 +526,27 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			display: false,
 			timestamp: Date.now(),
 		};
+	}
+
+	function ensurePlanningQuestionsToolRegistered(): void {
+		if (planningQuestionsToolRegistered) return;
+		registerPlanningQuestionTool(pi);
+		planningQuestionsToolRegistered = true;
+	}
+
+	function setPlanningTools(ctx: ExtensionContext): void {
+		if (ctx.hasUI) {
+			ensurePlanningQuestionsToolRegistered();
+		}
+		pi.setActiveTools(buildPlanningToolNames(runtimeConfig.tools.plan, ctx.hasUI));
+	}
+
+	function setImplementationTools(): void {
+		pi.setActiveTools(buildPlanningToolNames(runtimeConfig.tools.implementation, false));
+	}
+
+	function buildPlanPrompt(ctx: ExtensionContext): string {
+		return ctx.hasUI ? `${PLAN_PROMPT}\n\n${PLAN_QUESTION_INTERACTIVE_PROMPT}` : PLAN_PROMPT;
 	}
 
 	function getLocalUsername(): string {
@@ -652,7 +691,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		activeContextFallback = null;
 		setAcceptedPlan(null);
 		consecutiveLengthAutoContinues = 0;
-		pi.setActiveTools(runtimeConfig.tools.implementation);
+		setImplementationTools();
 		updateStatus(ctx);
 		persist();
 	}
@@ -666,7 +705,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		activeContextFallback = null;
 		setAcceptedPlan(null);
 		consecutiveLengthAutoContinues = 0;
-		pi.setActiveTools(runtimeConfig.tools.plan);
+		setPlanningTools(ctx);
 		const ok = await bindProviderForRung(runtimeConfig.ladder[0], ctx);
 		if (!ok) {
 			reset(ctx);
@@ -685,7 +724,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		activeBump = null;
 		activeContextFallback = null;
 		consecutiveLengthAutoContinues = 0;
-		pi.setActiveTools(runtimeConfig.tools.implementation);
+		setImplementationTools();
 		updateStatus(ctx);
 		persist();
 
@@ -723,10 +762,10 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// before_agent_start: inject the phase nudge as the first message of each
 	// new agent run. Model is already bound (at /plan or at accept).
 	// -------------------------------------------------------------------------
-	pi.on("before_agent_start", async () => {
+	pi.on("before_agent_start", async (_event, ctx) => {
 		if (mode === "planning") {
 			return {
-				message: { customType: "plan-stepdown-context", content: PLAN_PROMPT, display: false },
+				message: { customType: "plan-stepdown-context", content: buildPlanPrompt(ctx), display: false },
 			};
 		}
 		if (mode === "implementing" && stage === 1) {
@@ -973,8 +1012,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			activeBump = null;
 			activeContextFallback = null;
 			consecutiveLengthAutoContinues = 0;
-			if (mode === "planning") pi.setActiveTools(runtimeConfig.tools.plan);
-			if (mode === "implementing") pi.setActiveTools(runtimeConfig.tools.implementation);
+			if (mode === "planning") setPlanningTools(ctx);
+			if (mode === "implementing") setImplementationTools();
 			updateStatus(ctx);
 		}
 		if (pi.getFlag(PLAN_AUTO_APPROVE_FLAG) === true && mode === "idle") {

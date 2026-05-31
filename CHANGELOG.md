@@ -16,6 +16,8 @@
 - Documented the accepted-plan persistence/injection path in the README so compaction behavior and restore semantics are clear.
 
 ### Added
+- Added interactive plan-clarification questions for interactive/RPC plan mode via an extension-managed tool that can collect structured answers before the final plan.
+- Kept the plan-clarification tool out of headless/no-UI sessions so CLI planning falls back to plain-text clarification or conservative assumptions.
 - Added an entrypoint smoke test so package-scope/import regressions fail under `npm test`.
 
 ## v0.3.2 - 2026-05-13
