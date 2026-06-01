@@ -64,6 +64,7 @@ import {
 	applyOpenAIWebSearchToPayload,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
+	capThinkingLevel,
 	chooseContextSafeRungIndex,
 	chooseRungIndex,
 	createPromptCacheKey,
@@ -71,12 +72,15 @@ import {
 	extractLatestAssistantText,
 	formatAcceptedPlanContext,
 	hasCustomMessage,
+	isMaxOutputTokensLikeStop,
+	nextReasoningEffortForMaxOutput,
 	nextStage,
 	normalizeAcceptedPlan,
 	type MessageWithRole,
 	type Mode,
 	type OpenAIWebSearchUserLocation,
 	type Rung,
+	type ThinkingLevel,
 } from "./rewrite.ts";
 import {
 	DEFAULT_PLAN_STEPDOWN_CONFIG,
@@ -140,13 +144,15 @@ const TIMEZONE_COUNTRY: Record<string, string> = {
 const BUMP_RUNG_INDEX = 1;
 const CONTEXT_FALLBACK_RESERVE_TOKENS = 16384;
 const MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES = 2;
+const MAX_CONSECUTIVE_MAX_OUTPUT_RESCUES = 3;
+const MAX_OUTPUT_RESCUE_REASON = "max output tokens exhausted";
 const ACCEPTED_PLAN_ENTRY_TYPE = "plan-stepdown-accepted-plan";
 const ACCEPTED_PLAN_CONTEXT_CUSTOM_TYPE = "plan-stepdown-accepted-plan-context";
 const IMPLEMENTATION_KICKOFF_CUSTOM_TYPE = "plan-stepdown-implement";
 const IMPLEMENTATION_KICKOFF_MESSAGE = "Please start implementation.";
 const IMPLEMENTATION_CONTINUE_CUSTOM_TYPE = "plan-stepdown-continue";
 const IMPLEMENTATION_CONTINUE_MESSAGE =
-	"Continue from where you left off. If the implementation is complete, summarize what changed and stop.";
+	"Continue from where you left off. Keep the next step concise; if the implementation is complete, summarize what changed and stop.";
 
 function expandHomePath(path: string): string {
 	if (path === "~") return homedir();
@@ -404,11 +410,19 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// One-shot bump state.
 	let pendingBump: { rungIndex: number; reason: string } | null = null;
 	let activeBump: { rungIndex: number; reason: string } | null = null;
+	let pendingMaxOutputRescue:
+		| { rungIndex: number; from: ThinkingLevel; to: ThinkingLevel }
+		| null = null;
+	let activeMaxOutputRescue:
+		| { rungIndex: number; from: ThinkingLevel; to: ThinkingLevel }
+		| null = null;
 	let activeContextFallback:
 		| { fromIndex: number; toIndex: number; contextTokens: number; contextWindow: number }
 		| null = null;
+	let lastProviderRequest: { rungIndex: number; thinking: ThinkingLevel } | null = null;
 	let acceptedPlan: string | null = null;
 	let consecutiveLengthAutoContinues = 0;
+	let consecutiveMaxOutputRescues = 0;
 	let autonomousMessageToken = 0;
 	let planningQuestionsToolRegistered = false;
 
@@ -427,7 +441,22 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (activeContextFallback) return activeContextFallback.toIndex;
 		if (mode === "planning") return 0;
 		if (activeBump) return activeBump.rungIndex;
+		if (activeMaxOutputRescue) return activeMaxOutputRescue.rungIndex;
 		return activeRungIndex();
+	}
+
+	function formatMaxOutputRescue(rescue: { rungIndex: number; from: ThinkingLevel; to: ThinkingLevel } | null): string | null {
+		if (!rescue) return null;
+		const rung = runtimeConfig.ladder[rescue.rungIndex];
+		if (!rung) return null;
+		return `${rungLabel({ ...rung, thinking: rescue.from }, rescue.rungIndex)} → ${rescue.to}`;
+	}
+
+	function getAppliedRung(rung: Rung): Rung {
+		const rescue = pendingMaxOutputRescue ?? activeMaxOutputRescue;
+		if (!rescue) return rung;
+		const thinking = capThinkingLevel(rung.thinking, rescue.to);
+		return thinking === rung.thinking ? rung : { ...rung, thinking };
 	}
 
 	function formatStepdownReport(ctx: ExtensionContext): string {
@@ -462,8 +491,19 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		} else if (pendingBump) {
 			lines.push(`next bump: [${pendingBump.rungIndex}] ${pendingBump.reason}`);
 		}
+		if (activeMaxOutputRescue) {
+			const label = formatMaxOutputRescue(activeMaxOutputRescue);
+			if (label) lines.push(`max-output rescue: active ${label}`);
+		}
+		if (pendingMaxOutputRescue) {
+			const label = formatMaxOutputRescue(pendingMaxOutputRescue);
+			if (label) lines.push(`max-output rescue: next ${label}`);
+		}
 		if (consecutiveLengthAutoContinues > 0) {
 			lines.push(`length auto-continue: ${consecutiveLengthAutoContinues}/${MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES}`);
+		}
+		if (consecutiveMaxOutputRescues > 0) {
+			lines.push(`max-output rescues: ${consecutiveMaxOutputRescues}/${MAX_CONSECUTIVE_MAX_OUTPUT_RESCUES}`);
 		}
 		lines.push(`accepted plan: ${acceptedPlan ? `stored (${acceptedPlan.length.toLocaleString()} chars)` : "none"}`);
 		lines.push(`plan questions: ${mode === "planning" && ctx.hasUI ? "interactive" : "inactive"}`);
@@ -485,6 +525,17 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 
 	function persist(): void {
 		pi.appendEntry("plan-stepdown-state", { mode, stage });
+	}
+
+	function clearTransientState(): void {
+		pendingBump = null;
+		activeBump = null;
+		pendingMaxOutputRescue = null;
+		activeMaxOutputRescue = null;
+		activeContextFallback = null;
+		lastProviderRequest = null;
+		consecutiveLengthAutoContinues = 0;
+		consecutiveMaxOutputRescues = 0;
 	}
 
 	function setAcceptedPlan(plan: string | null | undefined): void {
@@ -631,8 +682,16 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 			} else if (pendingBump) {
 				suffixParts.push(`next↑ ${pendingBump.reason}`);
 			}
+			if (activeMaxOutputRescue) {
+				suffixParts.push(`mo ${activeMaxOutputRescue.from}→${activeMaxOutputRescue.to}`);
+			} else if (pendingMaxOutputRescue) {
+				suffixParts.push(`next-mo ${pendingMaxOutputRescue.from}→${pendingMaxOutputRescue.to}`);
+			}
 			if (consecutiveLengthAutoContinues > 0) {
 				suffixParts.push(`↻len ${consecutiveLengthAutoContinues}/${MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES}`);
+			}
+			if (consecutiveMaxOutputRescues > 0) {
+				suffixParts.push(`↻mo ${consecutiveMaxOutputRescues}/${MAX_CONSECUTIVE_MAX_OUTPUT_RESCUES}`);
 			}
 		}
 
@@ -676,11 +735,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		autonomousMessageToken++;
 		mode = "idle";
 		stage = 0;
-		pendingBump = null;
-		activeBump = null;
-		activeContextFallback = null;
+		clearTransientState();
 		setAcceptedPlan(null);
-		consecutiveLengthAutoContinues = 0;
 		setImplementationTools();
 		updateStatus(ctx);
 		persist();
@@ -690,11 +746,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		autonomousMessageToken++;
 		mode = "planning";
 		stage = 0;
-		pendingBump = null;
-		activeBump = null;
-		activeContextFallback = null;
+		clearTransientState();
 		setAcceptedPlan(null);
-		consecutiveLengthAutoContinues = 0;
 		setPlanningTools(ctx);
 		const ok = await bindProviderForRung(runtimeConfig.ladder[0], ctx);
 		if (!ok) {
@@ -710,10 +763,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	function startImplementation(ctx: ExtensionContext): void {
 		mode = "implementing";
 		stage = 1;
-		pendingBump = null;
-		activeBump = null;
-		activeContextFallback = null;
-		consecutiveLengthAutoContinues = 0;
+		clearTransientState();
 		setImplementationTools();
 		updateStatus(ctx);
 		persist();
@@ -782,16 +832,23 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// -------------------------------------------------------------------------
 	pi.on("turn_start", async (_event, ctx) => {
 		activeContextFallback = null;
+		lastProviderRequest = null;
 		if (mode !== "implementing") {
 			updateStatus(ctx);
 			return;
 		}
 		if (!pendingBump) {
+			if (pendingMaxOutputRescue) {
+				activeMaxOutputRescue = pendingMaxOutputRescue;
+				pendingMaxOutputRescue = null;
+			}
 			updateStatus(ctx);
 			return;
 		}
 		activeBump = pendingBump;
 		pendingBump = null;
+		pendingMaxOutputRescue = null;
+		activeMaxOutputRescue = null;
 		updateStatus(ctx);
 	});
 
@@ -821,7 +878,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 	// rewritten payload replaces what gets sent.
 	// -------------------------------------------------------------------------
 	pi.on("before_provider_request", (event, ctx) => {
-		const preferredIndex = activeBump?.rungIndex ?? chooseRungIndex(mode, stage, runtimeConfig.ladder);
+		const preferredIndex =
+			activeBump?.rungIndex ?? activeMaxOutputRescue?.rungIndex ?? chooseRungIndex(mode, stage, runtimeConfig.ladder);
 		if (preferredIndex === null) return;
 
 		const contextUsage = ctx.getContextUsage();
@@ -841,6 +899,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (!selection) return;
 
 		const rung = runtimeConfig.ladder[selection.index];
+		const appliedRung = getAppliedRung(rung);
+		lastProviderRequest = { rungIndex: selection.index, thinking: appliedRung.thinking };
 		const model = ctx.modelRegistry.find(runtimeConfig.provider, rung.modelId);
 		const nextContextFallback =
 			selection.fallback && contextUsage?.tokens
@@ -859,7 +919,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		activeContextFallback = nextContextFallback;
 		if (contextFallbackChanged) updateStatus(ctx);
 
-		let payload = applyRungToPayload(event.payload, rung);
+		let payload = applyRungToPayload(event.payload, appliedRung);
 		const webSearchEnabled = runtimeConfig.openaiWebSearch.enabled && model?.api === "openai-responses";
 		payload = applyOpenAIWebSearchToPayload(payload, {
 			enabled: webSearchEnabled,
@@ -891,11 +951,12 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		const stop = (event.message as { stopReason?: string } | undefined)?.stopReason;
 		if (stop === "aborted") return;
 
-		// If a bump or context fallback was active for this turn, advance from
-		// the rung that actually handled the request. Otherwise advance from the
-		// current stage as normal.
-		const actualRungIndex = activeContextFallback?.toIndex ?? activeBump?.rungIndex ?? stage;
+		// If a bump, rescue override, or context fallback was active for this
+		// turn, advance from the rung that actually handled the request.
+		// Otherwise advance from the current stage as normal.
+		const actualRungIndex = lastProviderRequest?.rungIndex ?? activeContextFallback?.toIndex ?? activeBump?.rungIndex ?? activeMaxOutputRescue?.rungIndex ?? stage;
 		activeBump = null;
+		activeMaxOutputRescue = null;
 		activeContextFallback = null;
 
 		stage = nextStage(actualRungIndex, runtimeConfig.ladder);
@@ -923,18 +984,62 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (mode === "implementing") {
 			const lastAssistant = [...event.messages]
 				.reverse()
-				.find((message) => message.role === "assistant") as { stopReason?: string } | undefined;
+				.find((message) => message.role === "assistant") as { stopReason?: string; errorMessage?: string } | undefined;
 			const stop = lastAssistant?.stopReason;
-			const shouldAutoContinueLength =
-				stop === "length" &&
-				!ctx.hasPendingMessages() &&
-				consecutiveLengthAutoContinues < MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES;
+			const errorMessage = lastAssistant?.errorMessage;
+			const maxOutputLike = isMaxOutputTokensLikeStop({ stopReason: stop, errorMessage });
+			const hasPendingUserMessages = ctx.hasPendingMessages();
 
 			pendingBump = null;
 			activeBump = null;
 			activeContextFallback = null;
 
-			if (shouldAutoContinueLength) {
+			if (maxOutputLike && !hasPendingUserMessages && consecutiveMaxOutputRescues < MAX_CONSECUTIVE_MAX_OUTPUT_RESCUES && lastProviderRequest) {
+				const nextEffort = nextReasoningEffortForMaxOutput(lastProviderRequest.thinking);
+				if (nextEffort) {
+					pendingMaxOutputRescue = {
+						rungIndex: lastProviderRequest.rungIndex,
+						from: lastProviderRequest.thinking,
+						to: nextEffort,
+					};
+					consecutiveMaxOutputRescues++;
+					consecutiveLengthAutoContinues = 0;
+					updateStatus(ctx);
+					persist();
+					queueAutonomousFollowUp(
+						ctx,
+						IMPLEMENTATION_CONTINUE_CUSTOM_TYPE,
+						IMPLEMENTATION_CONTINUE_MESSAGE,
+						() => mode === "implementing" && stage > 0,
+					);
+					return;
+				}
+				if (runtimeConfig.ladder.length > 0) {
+					pendingMaxOutputRescue = null;
+					activeMaxOutputRescue = null;
+					pendingBump = {
+						rungIndex: Math.min(BUMP_RUNG_INDEX, runtimeConfig.ladder.length - 1),
+						reason: MAX_OUTPUT_RESCUE_REASON,
+					};
+					consecutiveMaxOutputRescues++;
+					consecutiveLengthAutoContinues = 0;
+					updateStatus(ctx);
+					persist();
+					queueAutonomousFollowUp(
+						ctx,
+						IMPLEMENTATION_CONTINUE_CUSTOM_TYPE,
+						IMPLEMENTATION_CONTINUE_MESSAGE,
+						() => mode === "implementing" && stage > 0,
+					);
+					return;
+				}
+			}
+
+			if (
+				stop === "length" &&
+				!hasPendingUserMessages &&
+				consecutiveLengthAutoContinues < MAX_CONSECUTIVE_LENGTH_AUTO_CONTINUES
+			) {
 				consecutiveLengthAutoContinues++;
 				updateStatus(ctx);
 				persist();
@@ -947,8 +1052,8 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
+			clearTransientState();
 			stage = 0;
-			consecutiveLengthAutoContinues = 0;
 			updateStatus(ctx);
 			persist();
 			return;
@@ -998,10 +1103,7 @@ export default function planStepdownExtension(pi: ExtensionAPI): void {
 		if (last?.data) {
 			mode = last.data.mode;
 			stage = last.data.stage;
-			pendingBump = null;
-			activeBump = null;
-			activeContextFallback = null;
-			consecutiveLengthAutoContinues = 0;
+			clearTransientState();
 			if (mode === "planning") setPlanningTools(ctx);
 			if (mode === "implementing") setImplementationTools();
 			updateStatus(ctx);

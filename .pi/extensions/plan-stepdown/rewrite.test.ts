@@ -16,6 +16,7 @@ import {
 	applyOpenAIWebSearchToPayload,
 	applyPromptCacheToPayload,
 	applyRungToPayload,
+	capThinkingLevel,
 	chooseContextSafeRungIndex,
 	chooseRung,
 	contentText,
@@ -25,6 +26,8 @@ import {
 	extractLatestAssistantText,
 	formatAcceptedPlanContext,
 	hasCustomMessage,
+	isMaxOutputTokensLikeStop,
+	nextReasoningEffortForMaxOutput,
 	nextStage,
 	normalizeAcceptedPlan,
 	startsWithShellCommand,
@@ -653,6 +656,54 @@ test("detectReasoningBump: can disable non-bash failed-tool bump", () => {
 	assert.equal(detectReasoningBump({ toolName: "bash", input: { command: "false" }, isError: true }, cfg), "failed bash command");
 });
 
+test("isMaxOutputTokensLikeStop: treats length stops as max-output-like", () => {
+	assert.equal(isMaxOutputTokensLikeStop({ stopReason: "length" }), true);
+});
+
+test("isMaxOutputTokensLikeStop: detects proxy/OpenAI incomplete error text", () => {
+	assert.equal(
+		isMaxOutputTokensLikeStop({ stopReason: "error", errorMessage: "upstream_terminal_failure_preflush type=response.incomplete reason=max_output_tokens" }),
+		true,
+	);
+	assert.equal(
+		isMaxOutputTokensLikeStop({ stopReason: "error", errorMessage: "Responses API returned response.incomplete before first token" }),
+		true,
+	);
+	assert.equal(
+		isMaxOutputTokensLikeStop({ stopReason: "error", errorMessage: "incomplete: max_output_tokens" }),
+		true,
+	);
+});
+
+test("isMaxOutputTokensLikeStop: ignores non-max-output errors and stops", () => {
+	assert.equal(isMaxOutputTokensLikeStop({ stopReason: "error", errorMessage: "network timeout" }), false);
+	assert.equal(isMaxOutputTokensLikeStop({ stopReason: "stop", errorMessage: "max_output_tokens" }), false);
+	assert.equal(isMaxOutputTokensLikeStop({ stopReason: "aborted", errorMessage: "response.incomplete" }), false);
+});
+
+test("nextReasoningEffortForMaxOutput: downgrades xhigh to high", () => {
+	assert.equal(nextReasoningEffortForMaxOutput("xhigh"), "high");
+});
+
+test("nextReasoningEffortForMaxOutput: downgrades high to medium", () => {
+	assert.equal(nextReasoningEffortForMaxOutput("high"), "medium");
+});
+
+test("nextReasoningEffortForMaxOutput: medium and below request rung reset instead of another downgrade", () => {
+	assert.equal(nextReasoningEffortForMaxOutput("medium"), null);
+	assert.equal(nextReasoningEffortForMaxOutput("low"), null);
+	assert.equal(nextReasoningEffortForMaxOutput("minimal"), null);
+	assert.equal(nextReasoningEffortForMaxOutput(null), null);
+});
+
+test("capThinkingLevel: never raises thinking, only caps it", () => {
+	assert.equal(capThinkingLevel("xhigh", "high"), "high");
+	assert.equal(capThinkingLevel("high", "high"), "high");
+	assert.equal(capThinkingLevel("medium", "high"), "medium");
+	assert.equal(capThinkingLevel("low", "medium"), "low");
+	assert.equal(capThinkingLevel("minimal", "xhigh"), "minimal");
+});
+
 const STAGE_LADDER: Rung[] = [
 	{ modelId: "r0", thinking: "high" },
 	{ modelId: "r1", thinking: "high" },
@@ -963,4 +1014,153 @@ test("end-to-end with bump: bumped turn uses LADDER[1], next turn resumes at LAD
 		"gpt-5.5:high", // turn 3: LADDER[2] (resumed AFTER the bump rung, not from pre-bump stage)
 		"gpt-5.4:high", // turn 4: LADDER[3]
 	]);
+});
+
+// ============================================================================
+// End-to-end with max-output rescue: simulate repeated implementation runs that
+// terminate with max-output-like stops, confirming the extension retries the
+// same rung at lower effort (xhigh → high → medium) before falling back to a
+// bump/reset at LADDER[1]. Non-max-output errors should not enter this path.
+// ============================================================================
+
+function createMaxOutputRescueHarness(ladder: Rung[], initialStage: number) {
+	const MAX_CONSECUTIVE_MAX_OUTPUT_RESCUES = 3;
+	const BUMP_INDEX = Math.min(1, ladder.length - 1);
+	const basePayload = () => ({
+		model: "ignored",
+		input: [{ role: "user", content: "x" }],
+		stream: true,
+		reasoning: { effort: "ignored", summary: "auto" },
+	});
+
+	const seen: string[] = [];
+	let stage = initialStage;
+	let pendingBump: { rungIndex: number; reason: string } | null = null;
+	let activeBump: { rungIndex: number; reason: string } | null = null;
+	let pendingMaxOutputRescue: { rungIndex: number; from: Rung["thinking"]; to: Rung["thinking"] } | null = null;
+	let activeMaxOutputRescue: { rungIndex: number; from: Rung["thinking"]; to: Rung["thinking"] } | null = null;
+	let lastProviderRequest: { rungIndex: number; thinking: Rung["thinking"] } | null = null;
+	let consecutiveMaxOutputRescues = 0;
+
+	function fireAttempt(stopInfo: { stopReason?: string; errorMessage?: string | null }) {
+		// turn_start
+		lastProviderRequest = null;
+		if (!pendingBump) {
+			if (pendingMaxOutputRescue) {
+				activeMaxOutputRescue = pendingMaxOutputRescue;
+				pendingMaxOutputRescue = null;
+			}
+		} else {
+			activeBump = pendingBump;
+			pendingBump = null;
+			pendingMaxOutputRescue = null;
+			activeMaxOutputRescue = null;
+		}
+
+		// before_provider_request
+		const preferredIndex = activeBump?.rungIndex ?? activeMaxOutputRescue?.rungIndex ?? stage;
+		const rung = ladder[preferredIndex];
+		assert.ok(rung);
+		const rescue = pendingMaxOutputRescue ?? activeMaxOutputRescue;
+		const appliedThinking = rescue ? capThinkingLevel(rung.thinking, rescue.to) : rung.thinking;
+		const out = applyRungToPayload(basePayload(), { ...rung, thinking: appliedThinking }) as {
+			model: string;
+			reasoning: { effort: string };
+		};
+		seen.push(`${out.model}:${out.reasoning.effort}`);
+		lastProviderRequest = { rungIndex: preferredIndex, thinking: appliedThinking };
+
+		// turn_end
+		stage = nextStage(lastProviderRequest.rungIndex, ladder);
+		activeBump = null;
+		activeMaxOutputRescue = null;
+
+		// agent_end
+		const maxOutputLike = isMaxOutputTokensLikeStop(stopInfo);
+		pendingBump = null;
+		activeBump = null;
+		if (
+			maxOutputLike &&
+			consecutiveMaxOutputRescues < MAX_CONSECUTIVE_MAX_OUTPUT_RESCUES &&
+			lastProviderRequest
+		) {
+			const nextEffort = nextReasoningEffortForMaxOutput(lastProviderRequest.thinking);
+			if (nextEffort) {
+				pendingMaxOutputRescue = {
+					rungIndex: lastProviderRequest.rungIndex,
+					from: lastProviderRequest.thinking,
+					to: nextEffort,
+				};
+				consecutiveMaxOutputRescues++;
+				return { kind: "rescue" as const, to: nextEffort };
+			}
+			pendingMaxOutputRescue = null;
+			activeMaxOutputRescue = null;
+			pendingBump = { rungIndex: BUMP_INDEX, reason: "max output tokens exhausted" };
+			consecutiveMaxOutputRescues++;
+			return { kind: "bump" as const, rungIndex: BUMP_INDEX };
+		}
+
+		pendingMaxOutputRescue = null;
+		activeMaxOutputRescue = null;
+		lastProviderRequest = null;
+		consecutiveMaxOutputRescues = 0;
+		stage = 0;
+		return { kind: "reset" as const };
+	}
+
+	return {
+		seen,
+		fireAttempt,
+		getStage: () => stage,
+		getPendingBump: () => pendingBump,
+		getPendingMaxOutputRescue: () => pendingMaxOutputRescue,
+	};
+}
+
+test("end-to-end with max-output rescue: same rung steps xhigh → high → medium, then bumps to LADDER[1]", () => {
+	const ladder: Rung[] = [
+		{ modelId: "gpt-5.5:quick", thinking: "xhigh" },
+		{ modelId: "gpt-5.4", thinking: "xhigh" },
+		{ modelId: "gpt-5.4", thinking: "high" },
+		{ modelId: "gpt-5.4", thinking: "medium" },
+		{ modelId: "gpt-5.4-mini", thinking: "xhigh" },
+	];
+	const harness = createMaxOutputRescueHarness(ladder, 4);
+
+	assert.deepEqual(harness.fireAttempt({ stopReason: "length" }), { kind: "rescue", to: "high" });
+	assert.deepEqual(harness.getPendingMaxOutputRescue(), { rungIndex: 4, from: "xhigh", to: "high" });
+
+	assert.deepEqual(harness.fireAttempt({ stopReason: "length" }), { kind: "rescue", to: "medium" });
+	assert.deepEqual(harness.getPendingMaxOutputRescue(), { rungIndex: 4, from: "high", to: "medium" });
+
+	assert.deepEqual(harness.fireAttempt({ stopReason: "length" }), { kind: "bump", rungIndex: 1 });
+	assert.deepEqual(harness.getPendingBump(), { rungIndex: 1, reason: "max output tokens exhausted" });
+
+	// Next autonomous retry uses the queued bump/reset rung.
+	assert.deepEqual(harness.fireAttempt({ stopReason: "stop" }), { kind: "reset" });
+	assert.deepEqual(harness.seen, [
+		"gpt-5.4-mini:xhigh",
+		"gpt-5.4-mini:high",
+		"gpt-5.4-mini:medium",
+		"gpt-5.4:xhigh",
+	]);
+	assert.equal(harness.getStage(), 0);
+});
+
+test("end-to-end with max-output rescue: non-max-output errors do not trigger the rescue path", () => {
+	const ladder: Rung[] = [
+		{ modelId: "gpt-5.5:quick", thinking: "xhigh" },
+		{ modelId: "gpt-5.4", thinking: "xhigh" },
+		{ modelId: "gpt-5.4", thinking: "high" },
+		{ modelId: "gpt-5.4", thinking: "medium" },
+		{ modelId: "gpt-5.4-mini", thinking: "xhigh" },
+	];
+	const harness = createMaxOutputRescueHarness(ladder, 4);
+
+	assert.deepEqual(harness.fireAttempt({ stopReason: "error", errorMessage: "network timeout" }), { kind: "reset" });
+	assert.equal(harness.getPendingMaxOutputRescue(), null);
+	assert.equal(harness.getPendingBump(), null);
+	assert.deepEqual(harness.seen, ["gpt-5.4-mini:xhigh"]);
+	assert.equal(harness.getStage(), 0);
 });

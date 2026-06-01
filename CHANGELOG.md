@@ -7,6 +7,7 @@
 - Persisted the accepted implementation plan as a branch-local custom session entry and re-injected it on every implementing turn, so compaction no longer has to preserve the exact plan text verbatim.
 - Queued autonomous implementation kickoff/continuation messages through Pi's follow-up path while runs are still active, reducing `Cannot continue from message role: assistant` failures after compaction/retry.
 - Auto-continued capped `stopReason=length` implementation runs so long responses do not silently stall until the user nudges Pi.
+- Added a max-output rescue ladder for implementation mode so `response.incomplete reason=max_output_tokens` can automatically retry with lower reasoning effort before falling back to a rung bump.
 
 ### Changed
 - Updated Pi extension imports and documentation references for the `@earendil-works` package/repository namespace.
@@ -14,6 +15,7 @@
 - Added context-aware rung fallback so the extension can step forward to a later ladder rung with enough registered context headroom before sending the next provider request.
 - Updated `models.example.json` to match the default ladder, use current `$ENV_VAR` config syntax, and advertise a conservative 375k context window for the larger-context fallback rungs.
 - Documented the accepted-plan persistence/injection path in the README so compaction behavior and restore semantics are clear.
+- Documented the new max-output rescue path and the proxy error-text requirement for `response.incomplete reason=max_output_tokens` detection.
 
 ### Added
 - Added interactive plan-clarification questions for interactive/RPC plan mode via an extension-managed tool that can collect structured answers before the final plan.

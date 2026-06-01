@@ -12,6 +12,8 @@ export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type WebSearchContextSize = "low" | "medium" | "high";
 export type WebSearchContextSetting = WebSearchContextSize | "off";
 
+const THINKING_LEVEL_ORDER: readonly ThinkingLevel[] = ["minimal", "low", "medium", "high", "xhigh"];
+
 export type Rung = {
 	modelId: string;
 	thinking: ThinkingLevel;
@@ -60,6 +62,11 @@ export type ToolResultForBump = {
 	toolName: string;
 	input?: Record<string, unknown>;
 	isError: boolean;
+};
+
+export type AssistantStopInfo = {
+	stopReason?: string | null;
+	errorMessage?: string | null;
 };
 
 export type Mode = "idle" | "planning" | "implementing";
@@ -171,6 +178,32 @@ export function detectReasoningBump(event: ToolResultForBump, config: ReasoningB
 	}
 
 	return null;
+}
+
+export function isMaxOutputTokensLikeStop(info: AssistantStopInfo): boolean {
+	if (info.stopReason === "length") return true;
+	if (info.stopReason !== "error") return false;
+	const message = info.errorMessage?.toLowerCase();
+	if (!message) return false;
+	return (
+		message.includes("max_output_tokens") ||
+		message.includes("response.incomplete") ||
+		message.includes("incomplete: max_output_tokens")
+	);
+}
+
+export function nextReasoningEffortForMaxOutput(thinking: ThinkingLevel | null | undefined): Exclude<ThinkingLevel, "minimal" | "low"> | null {
+	if (thinking === "xhigh") return "high";
+	if (thinking === "high") return "medium";
+	return null;
+}
+
+export function capThinkingLevel(base: ThinkingLevel, cap: ThinkingLevel): ThinkingLevel {
+	const baseIndex = THINKING_LEVEL_ORDER.indexOf(base);
+	const capIndex = THINKING_LEVEL_ORDER.indexOf(cap);
+	if (baseIndex === -1) return cap;
+	if (capIndex === -1) return base;
+	return THINKING_LEVEL_ORDER[Math.min(baseIndex, capIndex)];
 }
 
 export type ApiKind =

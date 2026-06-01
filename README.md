@@ -381,7 +381,8 @@ only one rung). After a bumped turn, the stage cursor continues at the rung *aft
 | `turn_end` during implementing         | `stage = min(actualRung+1, LADDER.length-1)`  |
 | `tool_result` trigger (implementing)   | queue bump for next LLM call (resets cursor)  |
 | Aborted turn                           | stage NOT advanced (so /resume picks up here) |
-| `agent_end` + `stopReason=length`      | keep stage, queue capped auto-continue        |
+| `agent_end` + max-output-like stop     | lower reasoning on the next autonomous turn, or bump to `LADDER[1]` after `medium` |
+| `agent_end` + `stopReason=length`      | keep stage, queue capped auto-continue fallback |
 | `agent_end` during implementing        | `stage=0` (reset for next user prompt)        |
 | `/plan` again, or `/stepdown-off`      | reset                                         |
 
@@ -517,9 +518,19 @@ First check `/stepdown`: it now shows each rung's registered context window
 (`ctx=...`). The extension can only make context-safe fallback decisions from
 what pi's model registry says the models support. If your local
 `~/.pi/agent/models.json` still has older metadata (for example `gpt-5.4-mini`
-at `272000` instead of a conservative `375000`), update that file and restart pi. The
-extension also auto-continues capped `stopReason=length` implementation runs,
-but it will not guess around incorrect provider metadata.
+at `272000` instead of a conservative `375000`), update that file and restart pi.
+If a Responses run ends with `response.incomplete reason=max_output_tokens`, that
+can also mean hidden reasoning tokens exhausted the output budget. The extension
+now tries a max-output rescue ladder on the next autonomous turn
+(`xhigh → high → medium → LADDER[1]`), but it still will not guess around
+incorrect provider metadata.
+
+**`response.incomplete reason=max_output_tokens` or proxy errors that mention it**
+If the proxy fails before Pi receives a normal incomplete assistant message,
+it must forward `max_output_tokens` / `response.incomplete` in the downstream
+error text for the extension to recognize the failure. Without that signal,
+Pi only sees a generic error and the extension cannot safely tell this case
+apart from unrelated failures.
 
 **Accepted plan does not seem to survive compaction**
 That plan is stored as a custom session entry and re-injected into implementing
@@ -561,6 +572,8 @@ In non-interactive modes (`pi -p`, `--mode json`) there is no dialog UI. If you 
   make the wrong fallback decision.
 - `stopReason=length` auto-continuation is intentionally capped at two follow-up
   runs to avoid open-ended loops.
+- Max-output rescues are intentionally capped as well, so repeated
+  `response.incomplete reason=max_output_tokens` failures do not loop forever.
 
 ## How this extension is built
 
