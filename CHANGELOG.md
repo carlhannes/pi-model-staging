@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 - 2026-06-01
 
 ### Fixed
 - Deferred the plan-approval implementation kickoff until after Pi finishes settling the planning `agent_end` event, so choosing "Start implementation" automatically starts work again on current Pi releases.

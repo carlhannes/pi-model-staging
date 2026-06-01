@@ -125,13 +125,13 @@ included; see commit history if you want the rationale.
 pi install npm:pi-model-staging
 
 # Global, pinned to a specific release
-pi install npm:pi-model-staging@0.3.2
+pi install npm:pi-model-staging@0.4.0
 
 # Project-local (adds to .pi/settings.json — share with your team)
-pi install -l npm:pi-model-staging@0.3.2
+pi install -l npm:pi-model-staging@0.4.0
 
 # Try once without persisting
-pi -e npm:pi-model-staging@0.3.2
+pi -e npm:pi-model-staging@0.4.0
 ```
 
 `pi install` reads the `pi.extensions` field from `package.json` and loads the
@@ -166,7 +166,7 @@ remove the old source first to avoid duplicate commands:
 ```bash
 pi list
 pi remove <old-source-from-pi-list>
-pi install npm:pi-model-staging@0.3.2
+pi install npm:pi-model-staging@0.4.0
 ```
 
 ### Verify install
@@ -179,13 +179,13 @@ extension load errors, or run `/debug` in the interactive TUI.
 
 ```bash
 # Global (adds to ~/.pi/agent/settings.json)
-pi install git:github.com/carlhannes/pi-model-staging@v0.3.2
+pi install git:github.com/carlhannes/pi-model-staging@v0.4.0
 
 # Project-local (adds to .pi/settings.json — share with your team)
-pi install -l git:github.com/carlhannes/pi-model-staging@v0.3.2
+pi install -l git:github.com/carlhannes/pi-model-staging@v0.4.0
 
 # Try once without persisting
-pi -e git:github.com/carlhannes/pi-model-staging@v0.3.2
+pi -e git:github.com/carlhannes/pi-model-staging@v0.4.0
 ```
 
 Use this if you prefer to install from a Git tag/source instead of npm.
